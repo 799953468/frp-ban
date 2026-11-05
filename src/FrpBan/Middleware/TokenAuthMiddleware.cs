@@ -1,0 +1,57 @@
+using FrpBan.Configuration;
+using FrpBan.Services;
+using Microsoft.Extensions.Options;
+
+namespace FrpBan.Middleware;
+
+/// <summary>
+/// Enforces Bearer-token authentication on all routes under /api/.
+/// Requests with an invalid or missing token receive 401 and are
+/// logged to the fail2ban access log.
+/// </summary>
+public sealed class TokenAuthMiddleware(
+    RequestDelegate next,
+    IOptions<PluginSettings> settings,
+    IAccessLogService accessLog)
+{
+    private readonly string _token = settings.Value.Token;
+
+    public async Task InvokeAsync(HttpContext ctx)
+    {
+        if (!ctx.Request.Path.StartsWithSegments("/api"))
+        {
+            await next(ctx);
+            return;
+        }
+
+        var remoteIp = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var providedToken = ExtractToken(ctx.Request);
+
+        if (string.IsNullOrEmpty(providedToken) || providedToken != _token)
+        {
+            accessLog.LogUnauthorized(remoteIp, ctx.Request.Path, ctx.Request.Method);
+            ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await ctx.Response.WriteAsync("Unauthorized");
+            return;
+        }
+
+        await next(ctx);
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Extracts the token from the Authorization header ("Bearer &lt;token&gt;")
+    /// or the "token" query parameter, in that order.
+    /// </summary>
+    private static string? ExtractToken(HttpRequest request)
+    {
+        var authHeader = request.Headers.Authorization.ToString();
+        if (authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            return authHeader["Bearer ".Length..].Trim();
+
+        return request.Query.TryGetValue("token", out var q) ? q.ToString() : null;
+    }
+}

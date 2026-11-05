@@ -1,0 +1,21 @@
+# frps.toml example — frp server configuration with frp-ban plugin
+#
+# frps listens on port 7000; the frp-ban plugin server runs on localhost:9000.
+# frps calls the plugin before Login and NewUserConn operations so banned IPs
+# are rejected before any tunnel is established.
+
+bindPort = 7000
+
+# Optional: expose the frp-ban management API through frp itself so remote
+# fail2ban clients can reach it without opening an extra firewall port.
+# In this case frpc on another machine proxies its local port to frps,
+# and the frp-ban API sits behind the frp tunnel.
+#
+# Alternatively run frp-ban directly on a public port and add it to your
+# firewall allowlist.
+
+[[httpPlugins]]
+name = "frp-ban"
+addr = "127.0.0.1:9000"
+path = "/handler"
+ops  = ["Login", "NewUserConn"]

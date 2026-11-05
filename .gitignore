@@ -1,0 +1,23 @@
+# .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.idea/
+
+# Publish output
+publish/
+out/
+
+# Runtime data (never commit real bans or logs)
+*.json.bak
+/var/
+
+# Local settings overrides (may contain secrets)
+appsettings.Local.json
+appsettings.Production.json
+
+# OS
+.DS_Store
+Thumbs.db
