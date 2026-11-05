@@ -1,0 +1,49 @@
+[Unit]
+Description=frp-ban HTTP plugin server for frps
+Documentation=https://github.com/YOUR_ORG/frp-ban
+After=network.target
+# If frps runs on the same host, ensure frp-ban is ready first:
+# Before=frps.service
+
+[Service]
+Type=simple
+User=frp-ban
+Group=frp-ban
+WorkingDirectory=/opt/frp-ban
+
+ExecStart=/opt/frp-ban/frp-ban
+
+# ── Runtime configuration (override in the drop-in, see below) ─────────────
+# Token and other secrets should NOT be stored in this file.
+# Put them in /etc/frp-ban/env  (chmod 640, owned by root:frp-ban).
+EnvironmentFile=-/etc/frp-ban/env
+
+# ── Restart policy ──────────────────────────────────────────────────────────
+Restart=on-failure
+RestartSec=5s
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=frp-ban
+
+# ── Security hardening ──────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# Grant write access to the data and log directories only
+ReadWritePaths=/var/lib/frp-ban /var/log/frp-ban
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

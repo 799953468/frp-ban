@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 11 (daily build)
+        run: |
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality daily
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          echo "DOTNET_NOLOGO=1" >> "$GITHUB_ENV"
+          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
+
+      - name: Restore
+        run: dotnet restore FrpBan.sln
+
+      - name: Build
+        run: dotnet build FrpBan.sln --configuration Release --no-restore
+
+      - name: Publish (self-contained linux-x64)
+        run: |
+          dotnet publish src/FrpBan \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false \
+            -o ./publish/linux-x64
+          tar -czf frp-ban-linux-x64.tar.gz -C ./publish/linux-x64 .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frp-ban-linux-x64
+          path: ./publish/linux-x64
+          if-no-files-found: error

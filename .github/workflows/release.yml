@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - rid: linux-x64
+            os: linux
+            arch: x64
+          - rid: linux-arm64
+            os: linux
+            arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 11 (daily build)
+        run: |
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality daily
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          echo "DOTNET_NOLOGO=1" >> "$GITHUB_ENV"
+          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
+
+      - name: Restore
+        run: dotnet restore FrpBan.sln
+
+      - name: Publish (${{ matrix.rid }})
+        run: |
+          dotnet publish src/FrpBan \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false \
+            -o ./publish/${{ matrix.rid }}
+
+      - name: Archive
+        run: |
+          tar -czf frp-ban-${{ matrix.rid }}.tar.gz \
+            -C ./publish/${{ matrix.rid }} \
+            frp-ban appsettings.json
+        working-directory: .
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: frp-ban-${{ matrix.rid }}.tar.gz
+          generate_release_notes: true

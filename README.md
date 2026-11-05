@@ -132,6 +132,50 @@ sudo fail2ban-client reload
 
 ---
 
+## systemd service (server)
+
+Use the install script to deploy the compiled binary as a managed systemd service.
+
+```bash
+# 1. Build a self-contained binary
+dotnet publish src/FrpBan -c Release -r linux-x64 --self-contained -o ./publish/linux-x64
+
+# 2. Copy the repo to the server, then run
+sudo ./deploy/install.sh
+```
+
+The script:
+- creates a `frp-ban` system user (no login shell)
+- installs the binary to `/opt/frp-ban/`
+- creates `/var/lib/frp-ban/` (ban persistence) and `/var/log/frp-ban/` (access log)
+- places an env file at `/etc/frp-ban/env` (mode `0640`) for secrets
+- installs and enables `frp-ban.service`
+
+### Configuring the token
+
+Edit `/etc/frp-ban/env` (or `/opt/frp-ban/appsettings.json`) before starting:
+
+```bash
+# /etc/frp-ban/env
+PluginSettings__Token=CHANGE_ME_TO_A_LONG_RANDOM_SECRET
+```
+
+Then:
+
+```bash
+sudo systemctl restart frp-ban
+sudo systemctl status frp-ban
+journalctl -u frp-ban -f          # follow logs
+```
+
+### Uninstall
+
+```bash
+sudo ./deploy/install.sh --uninstall
+```
+
+---
+
 ## API Reference
 
 All `/api/*` endpoints require `Authorization: Bearer <token>` (or `?token=<token>`).
