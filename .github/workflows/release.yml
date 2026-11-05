@@ -46,11 +46,7 @@ jobs:
             -o ./publish/${{ matrix.rid }}
 
       - name: Archive
-        run: |
-          tar -czf frp-ban-${{ matrix.rid }}.tar.gz \
-            -C ./publish/${{ matrix.rid }} \
-            frp-ban appsettings.json
-        working-directory: .
+        run: tar -czf frp-ban-${{ matrix.rid }}.tar.gz -C ./publish/${{ matrix.rid }} .
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
