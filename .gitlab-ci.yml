@@ -4,10 +4,25 @@ default:
 variables:
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   DOTNET_NOLOGO: "1"
+  # Nightly feed for the preview runtime/ILLink packages
+  NUGET_PACKAGES: "${CI_PROJECT_DIR}/.nuget/packages"
 
 stages:
   - build
   - release
+
+.before_script_template: &dotnet_setup
+  before_script:
+    - >
+      cat > NuGet.config <<'EOF'
+      <?xml version="1.0" encoding="utf-8"?>
+      <configuration>
+        <packageSources>
+          <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+          <add key="dotnet-experimental" value="https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-experimental/nuget/v3/index.json" />
+        </packageSources>
+      </configuration>
+      EOF
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Build: triggered on every push / MR
@@ -16,6 +31,7 @@ build:
   stage: build
   rules:
     - if: '$CI_COMMIT_TAG == null'   # skip on tag push — release job covers it
+  <<: *dotnet_setup
   script:
     - dotnet restore FrpBan.slnx
     - dotnet build FrpBan.slnx --configuration Release --no-restore
@@ -39,6 +55,7 @@ build:
   stage: release
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+  <<: *dotnet_setup
   script:
     - dotnet restore FrpBan.slnx
     - >
