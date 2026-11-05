@@ -25,24 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup .NET 11 (daily build)
+      - name: Setup .NET 11 (preview)
         run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality daily
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
           echo "$HOME/.dotnet" >> "$GITHUB_PATH"
           echo "DOTNET_NOLOGO=1" >> "$GITHUB_ENV"
           echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
-
-      - name: Add .NET nightly NuGet feed
-        run: |
-          cat > NuGet.config <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
-              <add key="dotnet-experimental" value="https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-experimental/nuget/v3/index.json" />
-            </packageSources>
-          </configuration>
-          EOF
 
       - name: Restore
         run: dotnet restore FrpBan.slnx

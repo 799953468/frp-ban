@@ -1,11 +1,10 @@
 default:
-  image: mcr.microsoft.com/dotnet/nightly/sdk:11.0
+  # Stable base image with all native deps; install the .NET 11 preview SDK into it.
+  image: mcr.microsoft.com/dotnet/sdk:10.0
 
 variables:
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   DOTNET_NOLOGO: "1"
-  # Nightly feed for the preview runtime/ILLink packages
-  NUGET_PACKAGES: "${CI_PROJECT_DIR}/.nuget/packages"
 
 stages:
   - build
@@ -13,16 +12,9 @@ stages:
 
 .before_script_template: &dotnet_setup
   before_script:
-    - >
-      cat > NuGet.config <<'EOF'
-      <?xml version="1.0" encoding="utf-8"?>
-      <configuration>
-        <packageSources>
-          <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
-          <add key="dotnet-experimental" value="https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-experimental/nuget/v3/index.json" />
-        </packageSources>
-      </configuration>
-      EOF
+    - curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
+    - export PATH="$HOME/.dotnet:$PATH"
+    - dotnet --version
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Build: triggered on every push / MR
