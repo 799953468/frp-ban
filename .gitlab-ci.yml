@@ -17,8 +17,8 @@ build:
   rules:
     - if: '$CI_COMMIT_TAG == null'   # skip on tag push — release job covers it
   script:
-    - dotnet restore FrpBan.sln
-    - dotnet build FrpBan.sln --configuration Release --no-restore
+    - dotnet restore FrpBan.slnx
+    - dotnet build FrpBan.slnx --configuration Release --no-restore
     - >
       dotnet publish src/FrpBan
       -c Release
@@ -40,7 +40,7 @@ build:
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
   script:
-    - dotnet restore FrpBan.sln
+    - dotnet restore FrpBan.slnx
     - >
       dotnet publish src/FrpBan
       -c Release
