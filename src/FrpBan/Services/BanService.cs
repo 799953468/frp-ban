@@ -78,7 +78,7 @@ public sealed class BanService : IBanService, IDisposable
     }
 
     /// <inheritdoc/>
-    public async Task BanAsync(string ip, string reason, int? durationSeconds = null, CancellationToken cancellationToken = default)
+    public async Task BanAsync(string ip, string reason, int? durationSeconds = null)
     {
         var duration = durationSeconds ?? _settings.DefaultBanDurationSeconds;
         var expiresAt = duration > 0
