@@ -7,20 +7,35 @@ namespace FrpBan.Services;
 
 /// <summary>
 /// Thread-safe, file-persisted implementation of <see cref="IBanService"/>.
-/// Bans are kept in memory for fast lookup and flushed to disk on every change.
+/// Bans are kept in memory for fast lookup and flushed to disk periodically.
+/// Expired bans are cleaned up automatically.
 /// </summary>
-public sealed class BanService(
-    IOptions<PluginSettings> settings,
-    ILogger<BanService> logger) : IBanService
+public sealed class BanService : IBanService, IDisposable
 {
-    private readonly PluginSettings _settings = settings.Value;
+    private readonly PluginSettings _settings;
+    private readonly ILogger<BanService> _logger;
     private readonly ReaderWriterLockSlim _lock = new();
     private readonly Dictionary<string, BanEntry> _bans = [];
+    private readonly Timer _cleanupTimer;
+    private readonly Timer _persistTimer;
+    private volatile bool _isDirty;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
     };
+
+    public BanService(IOptions<PluginSettings> settings, ILogger<BanService> logger)
+    {
+        _settings = settings.Value;
+        _logger = logger;
+
+        // Clean up expired bans every 5 minutes
+        _cleanupTimer = new Timer(CleanupExpiredBans, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+
+        // Persist dirty state every 30 seconds (batch writes)
+        _persistTimer = new Timer(PersistIfDirty, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
 
     // Called once during startup via IHostedService or explicit init.
     public void Load()
@@ -43,11 +58,11 @@ public sealed class BanService(
             }
             finally { _lock.ExitWriteLock(); }
 
-            logger.LogInformation("Loaded {Count} active bans from {Path}", _bans.Count, path);
+            _logger.LogInformation("Loaded {Count} active bans from {Path}", _bans.Count, path);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Failed to load ban file from {Path}", path);
+            _logger.LogError(ex, "Failed to load ban file from {Path}", path);
         }
     }
 
@@ -76,10 +91,13 @@ public sealed class BanService(
         try { _bans[ip] = entry; }
         finally { _lock.ExitWriteLock(); }
 
-        logger.LogWarning("Banned {Ip} — reason: {Reason}, expires: {Expires}",
+        _logger.LogWarning("Banned {Ip} — reason: {Reason}, expires: {Expires}",
             ip, reason, expiresAt?.ToString("o") ?? "never");
 
-        await PersistAsync();
+        _isDirty = true;
+
+        // Force immediate persist for critical operations, but don't block
+        _ = Task.Run(PersistAsync);
     }
 
     /// <inheritdoc/>
@@ -92,8 +110,9 @@ public sealed class BanService(
 
         if (removed)
         {
-            logger.LogInformation("Unbanned {Ip}", ip);
-            await PersistAsync();
+            _logger.LogInformation("Unbanned {Ip}", ip);
+            _isDirty = true;
+            _ = Task.Run(PersistAsync);
         }
     }
 
@@ -103,7 +122,13 @@ public sealed class BanService(
         _lock.EnterReadLock();
         try
         {
-            return _bans.Values.Where(e => e.IsActive).ToList();
+            var result = new List<BanEntry>(_bans.Count);
+            foreach (var entry in _bans.Values)
+            {
+                if (entry.IsActive)
+                    result.Add(entry);
+            }
+            return result;
         }
         finally { _lock.ExitReadLock(); }
     }
@@ -111,6 +136,51 @@ public sealed class BanService(
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Removes expired bans from memory. Called periodically by timer.
+    /// </summary>
+    private void CleanupExpiredBans(object? state)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var toRemove = new List<string>();
+
+        _lock.EnterReadLock();
+        try
+        {
+            foreach (var (ip, entry) in _bans)
+            {
+                if (!entry.IsActive)
+                    toRemove.Add(ip);
+            }
+        }
+        finally { _lock.ExitReadLock(); }
+
+        if (toRemove.Count == 0)
+            return;
+
+        _lock.EnterWriteLock();
+        try
+        {
+            foreach (var ip in toRemove)
+                _bans.Remove(ip);
+        }
+        finally { _lock.ExitWriteLock(); }
+
+        _logger.LogInformation("Cleaned up {Count} expired bans", toRemove.Count);
+        _isDirty = true;
+    }
+
+    /// <summary>
+    /// Persists to disk only if there are pending changes. Called periodically by timer.
+    /// </summary>
+    private void PersistIfDirty(object? state)
+    {
+        if (_isDirty)
+        {
+            _ = Task.Run(PersistAsync);
+        }
+    }
 
     private async Task PersistAsync()
     {
@@ -128,10 +198,26 @@ public sealed class BanService(
 
             var json = JsonSerializer.Serialize(snapshot, JsonOptions);
             await File.WriteAllTextAsync(path, json);
+
+            _isDirty = false;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Failed to persist ban list to {Path}", path);
+            _logger.LogError(ex, "Failed to persist ban list to {Path}", path);
+        }
+    }
+
+    public void Dispose()
+    {
+        _cleanupTimer?.Dispose();
+        _persistTimer?.Dispose();
+        _lock?.Dispose();
+
+        // Final persist on shutdown
+        if (_isDirty)
+        {
+            PersistAsync().GetAwaiter().GetResult();
         }
     }
 }
+

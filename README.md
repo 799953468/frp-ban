@@ -178,7 +178,7 @@ sudo ./deploy/install.sh --uninstall
 
 ## API Reference
 
-All `/api/*` endpoints require `Authorization: Bearer <token>` (or `?token=<token>`).
+All `/api/*` endpoints require `Authorization: Bearer <token>` header. Query parameter authentication is not supported for security reasons (tokens would appear in server logs).
 
 | Method | Path | Body | Description |
 |--------|------|------|-------------|

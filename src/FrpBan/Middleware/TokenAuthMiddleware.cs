@@ -27,7 +27,7 @@ public sealed class TokenAuthMiddleware(
         var remoteIp = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         var providedToken = ExtractToken(ctx.Request);
 
-        if (string.IsNullOrEmpty(providedToken) || providedToken != _token)
+        if (string.IsNullOrEmpty(providedToken) || !ConstantTimeEquals(providedToken, _token))
         {
             accessLog.LogUnauthorized(remoteIp, ctx.Request.Path, ctx.Request.Method);
             ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -43,8 +43,8 @@ public sealed class TokenAuthMiddleware(
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Extracts the token from the Authorization header ("Bearer &lt;token&gt;")
-    /// or the "token" query parameter, in that order.
+    /// Extracts the token from the Authorization header ("Bearer &lt;token&gt;").
+    /// Query parameter fallback is intentionally not supported to prevent token leakage in logs.
     /// </summary>
     private static string? ExtractToken(HttpRequest request)
     {
@@ -52,6 +52,21 @@ public sealed class TokenAuthMiddleware(
         if (authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
             return authHeader["Bearer ".Length..].Trim();
 
-        return request.Query.TryGetValue("token", out var q) ? q.ToString() : null;
+        return null;
+    }
+
+    /// <summary>
+    /// Constant-time string comparison to prevent timing attacks on token validation.
+    /// </summary>
+    private static bool ConstantTimeEquals(string a, string b)
+    {
+        if (a.Length != b.Length)
+            return false;
+
+        var diff = 0;
+        for (var i = 0; i < a.Length; i++)
+            diff |= a[i] ^ b[i];
+
+        return diff == 0;
     }
 }
