@@ -1,70 +1,71 @@
 # FRP Ban v1.1.0
 
-本版本新增 client 独立发布包，server 和 client 均支持 Windows、macOS 及 Linux 的 x64 / ARM64。
-同时包含 v1.0.0 之后的 TLS、协议校验、封禁持久化和日志监控改进。
+This release adds standalone client packages alongside the server for Windows,
+macOS and Linux on x64 and ARM64. It also includes the TLS, protocol validation,
+ban persistence and log monitoring improvements made since v1.0.0.
 
-## 发布与安装包
+## Release Packages
 
-- GitHub / GitLab 使用相同脚本发布，按组件和运行平台分别构建。
-- 共提供 32 个安装包或便携压缩包，以及覆盖全部文件的 `SHA256SUMS`。
-- server 文件名前缀为 `frp-ban-`，client 为 `frp-ban-client-`；两者可独立安装，也可在同一台机器上共存。
-- 每个包包含完整 .NET 运行时、配置示例和许可证；client 另附 `rules.d` YAML 规则。
-- Linux client 包附带独立账户、启动命令、systemd / OpenRC 服务，升级时保留配置和规则。
+- GitHub and GitLab share the same release script and build each component for every runtime target.
+- Each release provides 32 native packages or portable archives, plus a `SHA256SUMS` file covering all downloads.
+- Server filenames start with `frp-ban-`; client filenames start with `frp-ban-client-`. Install either component independently or both on the same host.
+- Every package includes the complete self-contained .NET runtime, example configuration and license. Client packages also include YAML rules in `rules.d`.
+- Native Linux client packages include a dedicated service account, launcher and systemd/OpenRC services. Configuration and bundled rules are preserved on upgrade.
 
-| 平台 / 发行版 | 架构 | 下载格式（server / client 均提供） |
+| Platform / Distribution | Architectures | Formats (Server and Client) |
 | --- | --- | --- |
-| Windows | x64、ARM64 | `.zip` |
-| macOS | Intel x64、Apple Silicon ARM64 | `.tar.gz` |
-| Debian / Ubuntu | x64、ARM64 | `.deb` |
-| Fedora / RHEL / Rocky / AlmaLinux / openSUSE | x64、ARM64 | `.rpm` |
-| Arch Linux / Arch Linux ARM | x64、ARM64 | `.pkg.tar.zst` |
-| Alpine Linux（musl） | x64、ARM64 | `.apk` |
-| Linux 便携版（glibc / musl） | x64、ARM64 | `.tar.gz` |
+| Windows | x64, ARM64 | `.zip` |
+| macOS | Intel x64, Apple Silicon ARM64 | `.tar.gz` |
+| Debian / Ubuntu | x64, ARM64 | `.deb` |
+| Fedora / RHEL / Rocky / AlmaLinux / openSUSE | x64, ARM64 | `.rpm` |
+| Arch Linux / Arch Linux ARM | x64, ARM64 | `.pkg.tar.zst` |
+| Alpine Linux (musl) | x64, ARM64 | `.apk` |
+| Linux portable (glibc / musl) | x64, ARM64 | `.tar.gz` |
 
-### Arch Linux 安装
+### Arch Linux Installation
 
-下载所需组件；x64 安装示例：
+Download the components you need. For x64:
 
 ```sh
 sudo pacman -U ./frp-ban-1.1.0-linux-x64.pkg.tar.zst
 sudo pacman -U ./frp-ban-client-1.1.0-linux-x64.pkg.tar.zst
 ```
 
-Arch Linux ARM 请将文件名中的 `linux-x64` 替换为 `linux-arm64`。
+For Arch Linux ARM, replace `linux-x64` with `linux-arm64` in the filenames.
 
-- server 配置：`/etc/frp-ban/appsettings.json`；服务：`frp-ban`。
-- client 配置：`/etc/frp-ban-client/appsettings.json`；规则：`/etc/frp-ban-client/rules.d`；服务：`frp-ban-client`。
-- 安装后不会自动启用或启动服务。请先配置 Token、TLS 证书 / 信任链及日志规则，再按需执行 `sudo systemctl enable --now frp-ban` 或 `sudo systemctl enable --now frp-ban-client`。
-- `frp-ban-client` 账户需要具有被监控日志及其父目录的读取 / 访问权限，并在日志轮转后继续生效。
-- 默认 SSH 规则使用 `/var/log/auth.log`，请按本机日志路径调整；`journal` 日志源尚未实现。
+- Server configuration: `/etc/frp-ban/appsettings.json`; service: `frp-ban`.
+- Client configuration: `/etc/frp-ban-client/appsettings.json`; rules: `/etc/frp-ban-client/rules.d`; service: `frp-ban-client`.
+- Packages do not enable or start services automatically. Configure the token, TLS certificates/trust and log rules first, then run `sudo systemctl enable --now frp-ban` or `sudo systemctl enable --now frp-ban-client` as needed.
+- Grant the `frp-ban-client` account read access to monitored logs and search access to their parent directories. Preserve that access after log rotation.
+- The bundled SSH rules use `/var/log/auth.log`; adjust them to your host's log paths. The `journal` log source is not implemented.
 
-## 安全改进
+## Security Improvements
 
-- 严格校验协议帧长度和必填 JSON 字段，限制输入大小并拒绝截断、超长或格式错误的消息。
-- 完善自定义 CA、服务器名称、证书有效期和 mTLS 客户端证书用途校验。
-- 增加握手、读写超时及连接 / 消息速率限制，限制每 IP 状态占用。
-- frps HTTP 回调在读取请求体之前校验来源地址，默认仅监听 loopback；规范化 IP 并拒绝无效请求。
-- 启动时校验 Token 和嵌套配置；规则加载时校验表达式，缓存正则并设置执行超时。
+- Validate protocol frame lengths and required JSON fields, enforce input limits, and reject truncated, oversized or malformed messages.
+- Enforce custom CA trust, peer names, certificate validity and mTLS client certificate purpose.
+- Apply handshake/read/write deadlines, connection and message rate limits, and bounded per-IP state.
+- Authorize frps HTTP callback sources before reading request bodies, bind callbacks to loopback by default, normalize IP addresses and reject invalid requests.
+- Validate tokens and nested configuration at startup. Validate rule expressions during loading, cache regular expressions and enforce execution timeouts.
 
-## 稳定性与性能
+## Reliability and Performance
 
-- 串行化 client 协议交互，断线期间通过有界队列保留待发送的封禁请求，重连后重试。
-- 封禁文件采用单写入器合并更新和原子替换，避免并发持久化覆盖；损坏数据会使启动失败。
-- 日志读取保留不完整 UTF-8 行，处理文件轮转和超长输入，避免并发读取冲突。
-- 对阈值统计状态设置容量与过期限制，修复 JSON 匹配条件和 IP 提取逻辑。
-- 整理共享协议、TLS 校验、日志监控及测试项目结构，统一构建属性和 NuGet 版本管理。
+- Serialize client protocol exchanges and retain pending ban requests in a bounded queue during disconnections, retrying after reconnection.
+- Coalesce ban persistence through a single writer and atomically replace the ban file. Corrupt stored ban data fails startup instead of being silently discarded.
+- Serialize log reads, retain partial UTF-8 lines, and handle file rotation and oversized input.
+- Bound and expire threshold state, and separate JSON matching conditions from IP extraction.
+- Refactor the shared protocol, TLS validation, log monitors and test projects; centralize build properties and NuGet package versions.
 
-## 升级注意事项
+## Upgrade Notes
 
-- 建议 server 和 client 一起升级，并先备份原有配置、证书、规则和封禁数据。
-- server / client 必须配置相同的非占位 Token，长度至少 32 个字符；默认示例不能直接用于启动。
-- TLS 校验更严格：私有 CA 或自签证书需要配置受信任 CA，证书名称必须匹配连接地址；服务器要求 mTLS 时还需配置有效客户端证书。
-- frps 不在本机时，需要显式配置 HTTP 监听地址及可信回调来源。
-- client 待发送队列只保存在内存中，进程退出后不会持久保存。
-- Windows / macOS 请完整解压，配置后通过 `frp-ban[.cmd]` 或 `frp-ban-client[.cmd]` 启动；Linux 原生依赖仍需由系统提供，Alpine 包未签名。
-- 完整安装、依赖及配置步骤见本标签的 `docs/RELEASING.md`，下载后请使用 `SHA256SUMS` 校验文件。
+- Upgrade the server and client together where possible. Back up configuration, certificates, rules and ban data first.
+- Both components require the same non-placeholder token of at least 32 characters. The bundled example configuration is not ready to start unchanged.
+- TLS checks are stricter: configure a trusted CA for private or self-signed certificates, ensure certificate names match the connection address, and provide a valid client certificate when the server requires mTLS.
+- If frps runs on another host, explicitly configure the HTTP listener and trusted callback sources.
+- The client's pending ban queue is held in memory only and is not persisted across process exits.
+- On Windows and macOS, extract the entire archive, configure it, and use `frp-ban[.cmd]` or `frp-ban-client[.cmd]`. Native OS libraries are still required on Linux. Alpine packages are unsigned.
+- See `docs/RELEASING.md` in this tag for complete installation, dependency and configuration instructions. Verify downloads against `SHA256SUMS`.
 
-## 验证
+## Validation
 
-- 115 项 .NET 单元及集成测试通过。
-- 15 项发布脚本测试通过，覆盖双组件、8 个运行平台、Arch 包配置、归档内容、校验清单及 GitLab 资产上传逻辑。
+- 115 .NET unit and integration tests pass.
+- 15 release script tests pass, covering both components, eight runtime targets, Arch package configuration, archive contents, checksums and GitLab asset upload logic.
