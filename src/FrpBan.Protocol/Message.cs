@@ -6,9 +6,15 @@ namespace FrpBan.Protocol;
 
 /// <summary>
 /// Binary message format: [Type(1B)] [Length(4B)] [Body(variable)]
+/// Maximum message size: 64KB (security limit)
 /// </summary>
 public abstract record Message(MessageType Type)
 {
+    /// <summary>
+    /// Maximum message body size (64KB - prevents DoS attacks)
+    /// </summary>
+    public const int MaxBodySize = 65536;
+
     /// <summary>
     /// Serializes message to byte array.
     /// Format: [type:1B][length:4B][body:variable]
@@ -16,6 +22,9 @@ public abstract record Message(MessageType Type)
     public byte[] Serialize()
     {
         var bodyBytes = SerializeBody();
+        if (bodyBytes.Length > MaxBodySize)
+            throw new InvalidOperationException($"Message body exceeds maximum size: {bodyBytes.Length} > {MaxBodySize}");
+
         var totalLength = 1 + 4 + bodyBytes.Length; // type + length + body
         var buffer = new byte[totalLength];
 
@@ -28,7 +37,7 @@ public abstract record Message(MessageType Type)
 
     /// <summary>
     /// Deserializes message from byte array.
-    /// Reads type from first byte, then length, then passes remaining bytes to type-specific handler.
+    /// Returns null if incomplete message (need more data).
     /// </summary>
     public static (Message? message, int bytesRead) Deserialize(byte[] buffer, int offset = 0)
     {
@@ -39,13 +48,13 @@ public abstract record Message(MessageType Type)
         var type = (MessageType)buffer[offset];
         var bodyLength = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(offset + 1, 4));
 
-        // Sanity check: body length should be reasonable (< 10MB)
-        if (bodyLength > 10_000_000)
-            throw new InvalidOperationException($"Message body too large: {bodyLength} bytes");
+        // Security: enforce maximum message size (64KB)
+        if (bodyLength > MaxBodySize)
+            throw new InvalidOperationException($"Message body too large: {bodyLength} bytes (max: {MaxBodySize})");
 
         var totalLength = 5 + (int)bodyLength;
         if (offset + totalLength > buffer.Length)
-            return (null, 0);
+            return (null, 0); // Incomplete message
 
         var bodyBytes = buffer.AsSpan(offset + 5, (int)bodyLength);
         var message = DeserializeBody(type, bodyBytes);
@@ -82,7 +91,7 @@ public abstract record Message(MessageType Type)
 public sealed record HelloMessage(
     string Version,
     string ClientType,
-    string TokenHash  // SHA256 hash of token, not the token itself
+    string TokenHash  // SHA256 hash of token
 ) : Message(MessageType.Hello)
 {
     protected override byte[] SerializeBody()
@@ -99,7 +108,7 @@ public sealed record HelloMessage(
     public static Message FromBody(ReadOnlySpan<byte> body)
     {
         var json = Encoding.UTF8.GetString(body);
-        var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
         var root = doc.RootElement;
 
         return new HelloMessage(
@@ -133,7 +142,7 @@ public sealed record BanRequestMessage(
     public static Message FromBody(ReadOnlySpan<byte> body)
     {
         var json = Encoding.UTF8.GetString(body);
-        var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
         var root = doc.RootElement;
 
         return new BanRequestMessage(
@@ -161,7 +170,7 @@ public sealed record BanResponseMessage(
     public static Message FromBody(ReadOnlySpan<byte> body)
     {
         var json = Encoding.UTF8.GetString(body);
-        var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
         var root = doc.RootElement;
 
         return new BanResponseMessage(
@@ -233,7 +242,7 @@ public sealed record ErrorMessage(
     public static Message FromBody(ReadOnlySpan<byte> body)
     {
         var json = Encoding.UTF8.GetString(body);
-        var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
         return new ErrorMessage(
             doc.RootElement.GetProperty("Error").GetString() ?? "Unknown error"
         );

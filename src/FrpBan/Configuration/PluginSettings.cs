@@ -9,7 +9,7 @@ namespace FrpBan.Configuration;
 public sealed class PluginSettings
 {
     /// <summary>
-    /// Bearer token required to call the /api/* management endpoints.
+    /// Bearer token required for TLS client authentication.
     /// </summary>
     [Required]
     public string Token { get; init; } = string.Empty;
@@ -18,12 +18,6 @@ public sealed class PluginSettings
     /// Path to the JSON file used to persist the ban list across restarts.
     /// </summary>
     public string BanFilePath { get; init; } = "/var/lib/frp-ban/bans.json";
-
-    /// <summary>
-    /// Path to the access log file monitored by fail2ban.
-    /// Each unauthorised API access is appended here in a parseable format.
-    /// </summary>
-    public string AccessLogPath { get; init; } = "/var/log/frp-ban/access.log";
 
     /// <summary>
     /// Path to the main application log file (managed by Serilog).
@@ -43,13 +37,13 @@ public sealed class PluginSettings
     public int DefaultBanDurationSeconds { get; init; } = 3600;
 
     /// <summary>
-    /// TLS/HTTPS configuration settings for client-server communication.
+    /// TLS/TCP configuration settings for client-server communication.
     /// </summary>
     public TlsSettings? Tls { get; init; }
 }
 
 /// <summary>
-/// TLS/HTTPS configuration for secure client-server communication.
+/// TLS/TCP configuration for secure client-server communication.
 /// </summary>
 public sealed class TlsSettings
 {
@@ -99,4 +93,5 @@ public sealed class TlsSettings
     /// </summary>
     public string? ClientCertificateAuthority { get; init; }
 }
+
 

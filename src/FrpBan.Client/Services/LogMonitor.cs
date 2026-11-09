@@ -49,10 +49,14 @@ public abstract class LogMonitor
 }
 
 /// <summary>
-/// File-based log monitoring (tail -f style).
+/// File-based log monitoring using FileSystemWatcher for efficient change detection.
+/// PERFORMANCE: Uses FileSystemWatcher instead of polling, significantly reduces CPU usage.
 /// </summary>
 public sealed class FileLogMonitor : LogMonitor
 {
+    private FileSystemWatcher? _watcher;
+    private long _lastPosition;
+
     public FileLogMonitor(
         ILogger logger,
         BanRule rule,
@@ -71,54 +75,89 @@ public sealed class FileLogMonitor : LogMonitor
             return;
         }
 
-        _logger.LogInformation("Rule '{Rule}': monitoring file {Path}", _rule.Name, path);
+        var directory = Path.GetDirectoryName(path);
+        var fileName = Path.GetFileName(path);
 
-        while (!cancellationToken.IsCancellationRequested)
+        if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName))
         {
-            try
-            {
-                if (!File.Exists(path))
-                {
-                    await Task.Delay(5000, cancellationToken);
-                    continue;
-                }
+            _logger.LogError("Rule '{Rule}': invalid file path {Path}", _rule.Name, path);
+            return;
+        }
 
-                // Read file from end
-                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var reader = new StreamReader(stream))
-                {
-                    // Start from end
-                    stream.Seek(0, SeekOrigin.End);
+        _logger.LogInformation("Rule '{Rule}': monitoring file {Path} (using FileSystemWatcher)", _rule.Name, path);
 
-                    while (!cancellationToken.IsCancellationRequested)
-                    {
-                        var line = await reader.ReadLineAsync();
-                        if (line != null)
-                        {
-                            await ProcessLineAsync(line);
-                        }
-                        else
-                        {
-                            // No new lines, wait before checking again
-                            await Task.Delay(100, cancellationToken);
-                        }
-                    }
-                }
-            }
-            catch (FileNotFoundException)
+        // Get initial file size
+        if (File.Exists(path))
+        {
+            _lastPosition = new FileInfo(path).Length;
+        }
+
+        // Set up FileSystemWatcher
+        _watcher = new FileSystemWatcher(directory, fileName)
+        {
+            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
+            EnableRaisingEvents = true
+        };
+
+        _watcher.Changed += async (sender, e) => await OnFileChangedAsync(e.FullPath, cancellationToken);
+        _watcher.Created += async (sender, e) =>
+        {
+            _lastPosition = 0;
+            await OnFileChangedAsync(e.FullPath, cancellationToken);
+        };
+
+        // Keep task alive
+        try
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown
+        }
+        finally
+        {
+            _watcher?.Dispose();
+        }
+    }
+
+    private async Task OnFileChangedAsync(string filePath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Wait a bit for file to be fully written
+            await Task.Delay(50, cancellationToken);
+
+            using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+            if (stream.Length <= _lastPosition)
             {
-                _logger.LogWarning("Log file not found: {Path}", path);
-                await Task.Delay(5000, cancellationToken);
+                // File was truncated/rotated
+                _lastPosition = 0;
             }
-            catch (OperationCanceledException)
+
+            stream.Seek(_lastPosition, SeekOrigin.Begin);
+            using var reader = new StreamReader(stream);
+
+            string? line;
+            while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
             {
-                break;
+                await ProcessLineAsync(line);
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error monitoring file {Path}", path);
-                await Task.Delay(5000, cancellationToken);
-            }
+
+            _lastPosition = stream.Position;
+        }
+        catch (IOException ex)
+        {
+            _logger.LogDebug(ex, "Transient I/O error reading {Path}", filePath);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing file changes {Path}", filePath);
         }
     }
 

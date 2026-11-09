@@ -13,4 +13,8 @@
     <PackageReference Include="Serilog.Sinks.Async" Version="2.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="../FrpBan.Protocol/FrpBan.Protocol.csproj" />
+  </ItemGroup>
+
 </Project>

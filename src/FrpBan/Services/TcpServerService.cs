@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.Security;
@@ -15,14 +17,22 @@ namespace FrpBan.Services;
 
 /// <summary>
 /// TCP server service that listens for client connections over TLS.
-/// Implements binary protocol for ban requests and responses.
+/// Implements binary protocol with connection pooling and rate limiting.
+/// SECURITY: Limited buffer sizes, connection limits, rate limiting.
+/// PERFORMANCE: Uses ArrayPool for buffer management.
 /// </summary>
 public sealed class TcpServerService : IHostedService
 {
+    private const int MaxBufferSize = 1024 * 1024; // 1MB per connection
+    private const int MaxConcurrentConnections = 100;
+    private const int ReadBufferSize = 16384; // 16KB
+
     private readonly ILogger<TcpServerService> _logger;
     private readonly IOptions<PluginSettings> _settings;
     private readonly IBanService _banService;
-    private readonly IAccessLogService _accessLog;
+    private readonly SemaphoreSlim _connectionSemaphore = new(MaxConcurrentConnections);
+    private readonly ConcurrentDictionary<string, RateLimiter> _rateLimiters = new();
+
     private TcpListener? _listener;
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _listenerTask;
@@ -32,13 +42,11 @@ public sealed class TcpServerService : IHostedService
     public TcpServerService(
         ILogger<TcpServerService> logger,
         IOptions<PluginSettings> settings,
-        IBanService banService,
-        IAccessLogService accessLog)
+        IBanService banService)
     {
         _logger = logger;
         _settings = settings;
         _banService = banService;
-        _accessLog = accessLog;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -69,7 +77,8 @@ public sealed class TcpServerService : IHostedService
             // Start listening
             _listener = new TcpListener(IPAddress.Any, tls.Port);
             _listener.Start();
-            _logger.LogInformation("TCP listener started on port {Port}", tls.Port);
+            _logger.LogInformation("TCP listener started on port {Port} (max {MaxConnections} concurrent connections)",
+                tls.Port, MaxConcurrentConnections);
 
             _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _listenerTask = ListenForConnectionsAsync(_cancellationTokenSource.Token);
@@ -96,6 +105,7 @@ public sealed class TcpServerService : IHostedService
             }
         }
         _listener?.Stop();
+        _connectionSemaphore?.Dispose();
         _logger.LogInformation("TCP listener stopped");
     }
 
@@ -106,10 +116,41 @@ public sealed class TcpServerService : IHostedService
             try
             {
                 var client = await _listener!.AcceptTcpClientAsync(cancellationToken);
-                _logger.LogDebug("Client connected from {RemoteAddress}", client.Client.RemoteEndPoint);
+                var remoteAddress = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+
+                _logger.LogDebug("Client connected from {RemoteAddress}", remoteAddress);
+
+                // Rate limiting check
+                var clientIp = ((IPEndPoint?)client.Client.RemoteEndPoint)?.Address.ToString() ?? "unknown";
+                var rateLimiter = _rateLimiters.GetOrAdd(clientIp, _ => new RateLimiter());
+
+                if (!rateLimiter.AllowRequest())
+                {
+                    _logger.LogWarning("Rate limit exceeded for {RemoteAddress}", remoteAddress);
+                    client.Close();
+                    continue;
+                }
+
+                // Connection pool limit
+                if (!await _connectionSemaphore.WaitAsync(0, cancellationToken))
+                {
+                    _logger.LogWarning("Connection limit reached, rejecting {RemoteAddress}", remoteAddress);
+                    client.Close();
+                    continue;
+                }
 
                 // Handle each client connection in the background
-                _ = HandleClientAsync(client, cancellationToken);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await HandleClientAsync(client, cancellationToken);
+                    }
+                    finally
+                    {
+                        _connectionSemaphore.Release();
+                    }
+                }, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -130,6 +171,10 @@ public sealed class TcpServerService : IHostedService
             using (client)
             using (var networkStream = client.GetStream())
             {
+                // Set read/write timeouts
+                client.SendTimeout = 30000; // 30 seconds
+                client.ReceiveTimeout = 300000; // 5 minutes
+
                 // Upgrade to TLS
                 var sslStream = new SslStream(networkStream, leaveInnerStreamOpen: false);
 
@@ -163,28 +208,36 @@ public sealed class TcpServerService : IHostedService
     private async Task HandleProtocolAsync(SslStream sslStream, string remoteAddress, CancellationToken cancellationToken)
     {
         var isAuthenticated = false;
-        var buffer = new byte[16384];
-        var receiveBuffer = new byte[0];
+        var receiveBuffer = ArrayPool<byte>.Shared.Rent(MaxBufferSize);
+        var readBuffer = ArrayPool<byte>.Shared.Rent(ReadBufferSize);
+        var receiveBufferSize = 0;
 
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
                 // Read from stream
-                int bytesRead = await sslStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                int bytesRead = await sslStream.ReadAsync(readBuffer.AsMemory(0, ReadBufferSize), cancellationToken);
                 if (bytesRead == 0)
                 {
                     _logger.LogDebug("Client {RemoteAddress} disconnected", remoteAddress);
                     break;
                 }
 
+                // Security: enforce maximum buffer size
+                if (receiveBufferSize + bytesRead > MaxBufferSize)
+                {
+                    _logger.LogWarning("Buffer overflow attempt from {RemoteAddress}", remoteAddress);
+                    break;
+                }
+
                 // Append to receive buffer
-                Array.Resize(ref receiveBuffer, receiveBuffer.Length + bytesRead);
-                Buffer.BlockCopy(buffer, 0, receiveBuffer, receiveBuffer.Length - bytesRead, bytesRead);
+                Buffer.BlockCopy(readBuffer, 0, receiveBuffer, receiveBufferSize, bytesRead);
+                receiveBufferSize += bytesRead;
 
                 // Process complete messages
                 int offset = 0;
-                while (offset < receiveBuffer.Length)
+                while (offset < receiveBufferSize)
                 {
                     var (message, bytesConsumed) = Message.Deserialize(receiveBuffer, offset);
                     if (message == null)
@@ -199,7 +252,7 @@ public sealed class TcpServerService : IHostedService
                     if (response != null)
                     {
                         var responseBytes = response.Serialize();
-                        await sslStream.WriteAsync(responseBytes, 0, responseBytes.Length, cancellationToken);
+                        await sslStream.WriteAsync(responseBytes, cancellationToken);
                     }
 
                     if (response is ErrorMessage errorMsg && errorMsg.ErrorText.Contains("token"))
@@ -209,8 +262,8 @@ public sealed class TcpServerService : IHostedService
                 // Remove processed bytes from buffer
                 if (offset > 0)
                 {
-                    Array.Copy(receiveBuffer, offset, receiveBuffer, 0, receiveBuffer.Length - offset);
-                    Array.Resize(ref receiveBuffer, receiveBuffer.Length - offset);
+                    Buffer.BlockCopy(receiveBuffer, offset, receiveBuffer, 0, receiveBufferSize - offset);
+                    receiveBufferSize -= offset;
                 }
             }
         }
@@ -221,6 +274,11 @@ public sealed class TcpServerService : IHostedService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Protocol error with {RemoteAddress}", remoteAddress);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(receiveBuffer);
+            ArrayPool<byte>.Shared.Return(readBuffer);
         }
     }
 
@@ -250,7 +308,6 @@ public sealed class TcpServerService : IHostedService
         if (tokenHash != hello.TokenHash)
         {
             _logger.LogWarning("Invalid token hash from {RemoteAddress}", remoteAddress);
-            _accessLog.LogUnauthorized(remoteAddress, "/tls", "HELLO");
             return new ErrorMessage("Invalid token");
         }
 
@@ -278,7 +335,6 @@ public sealed class TcpServerService : IHostedService
             var reason = banReq.Reason ?? "client request";
             await _banService.BanAsync(banReq.Ip, reason, banReq.DurationSeconds);
 
-            _accessLog.LogBanAction(remoteAddress, "BAN", banReq.Ip);
             _logger.LogInformation("Banned {Ip} from {RemoteAddress}", banReq.Ip, remoteAddress);
 
             return new BanResponseMessage(true, $"Banned {banReq.Ip}");
@@ -313,10 +369,48 @@ public sealed class TcpServerService : IHostedService
 
     private string ComputeTokenHash(string token)
     {
-        using (var sha256 = SHA256.Create())
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
+        return Convert.ToHexString(hash);
+    }
+}
+
+/// <summary>
+/// Simple token bucket rate limiter.
+/// </summary>
+internal sealed class RateLimiter
+{
+    private const int MaxTokens = 10; // Max 10 requests
+    private const int RefillRateMs = 60000; // Per minute
+    private const int TokensPerRefill = 10;
+
+    private int _tokens = MaxTokens;
+    private long _lastRefillTicks = DateTimeOffset.UtcNow.Ticks;
+
+    public bool AllowRequest()
+    {
+        lock (this)
         {
-            var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
-            return Convert.ToHexString(hash);
+            Refill();
+
+            if (_tokens > 0)
+            {
+                _tokens--;
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    private void Refill()
+    {
+        var now = DateTimeOffset.UtcNow.Ticks;
+        var elapsedMs = (now - _lastRefillTicks) / TimeSpan.TicksPerMillisecond;
+
+        if (elapsedMs >= RefillRateMs)
+        {
+            _tokens = Math.Min(MaxTokens, _tokens + TokensPerRefill);
+            _lastRefillTicks = now;
         }
     }
 }

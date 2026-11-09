@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using FrpBan.Configuration;
 using FrpBan.Models;
@@ -9,16 +10,16 @@ namespace FrpBan.Services;
 /// Thread-safe, file-persisted implementation of <see cref="IBanService"/>.
 /// Bans are kept in memory for fast lookup and flushed to disk periodically.
 /// Expired bans are cleaned up automatically.
+/// PERFORMANCE: Uses ConcurrentDictionary for lock-free reads.
 /// </summary>
 public sealed class BanService : IBanService, IDisposable
 {
     private readonly PluginSettings _settings;
     private readonly ILogger<BanService> _logger;
-    private readonly ReaderWriterLockSlim _lock = new();
-    private readonly Dictionary<string, BanEntry> _bans = [];
+    private readonly ConcurrentDictionary<string, BanEntry> _bans = new();
     private readonly Timer _cleanupTimer;
     private readonly Timer _persistTimer;
-    private volatile bool _isDirty;
+    private int _isDirty; // 0 = clean, 1 = dirty (atomic operations)
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -50,13 +51,10 @@ public sealed class BanService : IBanService, IDisposable
             var entries = JsonSerializer.Deserialize<List<BanEntry>>(json, JsonOptions);
             if (entries is null) return;
 
-            _lock.EnterWriteLock();
-            try
+            foreach (var entry in entries.Where(e => e.IsActive))
             {
-                foreach (var entry in entries.Where(e => e.IsActive))
-                    _bans[entry.Ip] = entry;
+                _bans.TryAdd(entry.Ip, entry);
             }
-            finally { _lock.ExitWriteLock(); }
 
             _logger.LogInformation("Loaded {Count} active bans from {Path}", _bans.Count, path);
         }
@@ -69,12 +67,8 @@ public sealed class BanService : IBanService, IDisposable
     /// <inheritdoc/>
     public bool IsBanned(string ip)
     {
-        _lock.EnterReadLock();
-        try
-        {
-            return _bans.TryGetValue(ip, out var entry) && entry.IsActive;
-        }
-        finally { _lock.ExitReadLock(); }
+        // Lock-free read with ConcurrentDictionary
+        return _bans.TryGetValue(ip, out var entry) && entry.IsActive;
     }
 
     /// <inheritdoc/>
@@ -86,15 +80,12 @@ public sealed class BanService : IBanService, IDisposable
             : (DateTimeOffset?)null;
 
         var entry = new BanEntry(ip, reason, DateTimeOffset.UtcNow, expiresAt);
-
-        _lock.EnterWriteLock();
-        try { _bans[ip] = entry; }
-        finally { _lock.ExitWriteLock(); }
+        _bans[ip] = entry; // ConcurrentDictionary handles thread safety
 
         _logger.LogWarning("Banned {Ip} — reason: {Reason}, expires: {Expires}",
             ip, reason, expiresAt?.ToString("o") ?? "never");
 
-        _isDirty = true;
+        MarkDirty();
 
         // Force immediate persist for critical operations, but don't block
         _ = Task.Run(PersistAsync);
@@ -103,15 +94,12 @@ public sealed class BanService : IBanService, IDisposable
     /// <inheritdoc/>
     public async Task UnbanAsync(string ip)
     {
-        bool removed;
-        _lock.EnterWriteLock();
-        try { removed = _bans.Remove(ip); }
-        finally { _lock.ExitWriteLock(); }
+        bool removed = _bans.TryRemove(ip, out _);
 
         if (removed)
         {
             _logger.LogInformation("Unbanned {Ip}", ip);
-            _isDirty = true;
+            MarkDirty();
             _ = Task.Run(PersistAsync);
         }
     }
@@ -119,18 +107,13 @@ public sealed class BanService : IBanService, IDisposable
     /// <inheritdoc/>
     public IReadOnlyList<BanEntry> GetActiveBans()
     {
-        _lock.EnterReadLock();
-        try
+        var result = new List<BanEntry>(_bans.Count);
+        foreach (var entry in _bans.Values)
         {
-            var result = new List<BanEntry>(_bans.Count);
-            foreach (var entry in _bans.Values)
-            {
-                if (entry.IsActive)
-                    result.Add(entry);
-            }
-            return result;
+            if (entry.IsActive)
+                result.Add(entry);
         }
-        finally { _lock.ExitReadLock(); }
+        return result;
     }
 
     // -------------------------------------------------------------------------
@@ -138,37 +121,38 @@ public sealed class BanService : IBanService, IDisposable
     // -------------------------------------------------------------------------
 
     /// <summary>
+    /// Atomically marks the service as dirty (needs persist).
+    /// </summary>
+    private void MarkDirty() => Interlocked.Exchange(ref _isDirty, 1);
+
+    /// <summary>
+    /// Atomically checks and clears the dirty flag.
+    /// </summary>
+    private bool CheckAndClearDirty() => Interlocked.Exchange(ref _isDirty, 0) == 1;
+
+    /// <summary>
     /// Removes expired bans from memory. Called periodically by timer.
     /// </summary>
     private void CleanupExpiredBans(object? state)
     {
-        var now = DateTimeOffset.UtcNow;
         var toRemove = new List<string>();
 
-        _lock.EnterReadLock();
-        try
+        foreach (var (ip, entry) in _bans)
         {
-            foreach (var (ip, entry) in _bans)
-            {
-                if (!entry.IsActive)
-                    toRemove.Add(ip);
-            }
+            if (!entry.IsActive)
+                toRemove.Add(ip);
         }
-        finally { _lock.ExitReadLock(); }
 
         if (toRemove.Count == 0)
             return;
 
-        _lock.EnterWriteLock();
-        try
+        foreach (var ip in toRemove)
         {
-            foreach (var ip in toRemove)
-                _bans.Remove(ip);
+            _bans.TryRemove(ip, out _);
         }
-        finally { _lock.ExitWriteLock(); }
 
         _logger.LogInformation("Cleaned up {Count} expired bans", toRemove.Count);
-        _isDirty = true;
+        MarkDirty();
     }
 
     /// <summary>
@@ -176,7 +160,7 @@ public sealed class BanService : IBanService, IDisposable
     /// </summary>
     private void PersistIfDirty(object? state)
     {
-        if (_isDirty)
+        if (_isDirty == 1)
         {
             _ = Task.Run(PersistAsync);
         }
@@ -191,15 +175,11 @@ public sealed class BanService : IBanService, IDisposable
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
 
-            List<BanEntry> snapshot;
-            _lock.EnterReadLock();
-            try { snapshot = [.. _bans.Values]; }
-            finally { _lock.ExitReadLock(); }
-
+            var snapshot = _bans.Values.ToList();
             var json = JsonSerializer.Serialize(snapshot, JsonOptions);
             await File.WriteAllTextAsync(path, json);
 
-            _isDirty = false;
+            CheckAndClearDirty(); // Atomic clear
         }
         catch (Exception ex)
         {
@@ -211,10 +191,9 @@ public sealed class BanService : IBanService, IDisposable
     {
         _cleanupTimer?.Dispose();
         _persistTimer?.Dispose();
-        _lock?.Dispose();
 
         // Final persist on shutdown
-        if (_isDirty)
+        if (_isDirty == 1)
         {
             PersistAsync().GetAwaiter().GetResult();
         }

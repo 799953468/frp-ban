@@ -257,13 +257,21 @@ public sealed class ClientConnectionService
 
     private bool ValidateServerCertificate(
         object sender,
-        X509Certificate certificate,
-        X509Chain chain,
+        X509Certificate? certificate,
+        X509Chain? chain,
         SslPolicyErrors sslPolicyErrors)
     {
+        // Security: Production check - never disable validation in production
+        var isProduction = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") != "Development";
+
         if (!_settings.Tls.ValidateServerCertificate)
         {
-            _logger.LogWarning("Server certificate validation disabled (development mode)");
+            if (isProduction)
+            {
+                _logger.LogError("SECURITY: Cannot disable certificate validation in production");
+                return false;
+            }
+            _logger.LogWarning("Server certificate validation disabled (development mode only)");
             return true;
         }
 
@@ -273,7 +281,7 @@ public sealed class ClientConnectionService
             return false;
         }
 
-        // If self-signed certificates are allowed
+        // If self-signed certificates are allowed (with explicit configuration)
         if (_settings.Tls.AllowSelfSignedCertificates &&
             sslPolicyErrors == SslPolicyErrors.RemoteCertificateChainErrors)
         {

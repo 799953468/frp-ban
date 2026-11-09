@@ -1,5 +1,7 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/FrpBan.Protocol/FrpBan.Protocol.csproj" />
     <Project Path="src/FrpBan/FrpBan.csproj" />
+    <Project Path="src/FrpBan.Client/FrpBan.Client.csproj" />
   </Folder>
 </Solution>
