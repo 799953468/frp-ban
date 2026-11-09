@@ -7,7 +7,7 @@ variables:
   DOTNET_NOLOGO: "1"
 
 stages:
-  - build
+  - test
   - release
 
 .before_script_template: &dotnet_setup
@@ -17,31 +17,20 @@ stages:
     - dotnet --version
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Build: triggered on every push / MR
+# Test: Run unit tests on every push
 # ──────────────────────────────────────────────────────────────────────────────
-build:
-  stage: build
+test:
+  stage: test
   rules:
-    - if: '$CI_COMMIT_TAG == null'   # skip on tag push — release job covers it
+    - if: '$CI_COMMIT_TAG == null'
   <<: *dotnet_setup
   script:
     - dotnet restore FrpBan.slnx
-    - dotnet build FrpBan.slnx --configuration Release --no-restore
-    - >
-      dotnet publish src/FrpBan
-      -c Release
-      -r linux-x64
-      --self-contained true
-      -p:PublishSingleFile=true
-      -p:PublishTrimmed=false
-      -o ./publish/linux-x64
-  artifacts:
-    paths:
-      - ./publish/linux-x64/
-    expire_in: 1 week
+    - dotnet test FrpBan.slnx --configuration Release --no-restore --verbosity normal
+  coverage: '/^\s*Total\s+\|\s+(\d+\.\d+)%/'
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Release: triggered only on vX.Y.Z tags
+# Release Builds: Multi-platform binaries
 # ──────────────────────────────────────────────────────────────────────────────
 .publish_template: &publish_template
   stage: release

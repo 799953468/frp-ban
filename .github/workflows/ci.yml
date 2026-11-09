@@ -2,15 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - '**'
+    tags-ignore:
+      - 'v*'
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,23 +28,5 @@ jobs:
       - name: Restore
         run: dotnet restore FrpBan.slnx
 
-      - name: Build
-        run: dotnet build FrpBan.slnx --configuration Release --no-restore
-
-      - name: Publish (self-contained linux-x64)
-        run: |
-          dotnet publish src/FrpBan \
-            -c Release \
-            -r linux-x64 \
-            --self-contained true \
-            -p:PublishSingleFile=true \
-            -p:PublishTrimmed=false \
-            -o ./publish/linux-x64
-          tar -czf frp-ban-linux-x64.tar.gz -C ./publish/linux-x64 .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: frp-ban-linux-x64
-          path: ./publish/linux-x64
-          if-no-files-found: error
+      - name: Run tests
+        run: dotnet test FrpBan.slnx --no-restore --verbosity normal

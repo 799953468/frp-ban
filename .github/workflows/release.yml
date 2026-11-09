@@ -9,7 +9,27 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 11 (preview)
+        run: |
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          echo "DOTNET_NOLOGO=1" >> "$GITHUB_ENV"
+          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
+
+      - name: Restore
+        run: dotnet restore FrpBan.slnx
+
+      - name: Run tests
+        run: dotnet test FrpBan.slnx --no-restore --verbosity normal
+
+  build-and-release:
+    needs: test
     runs-on: ubuntu-latest
 
     strategy:
