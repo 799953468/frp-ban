@@ -28,19 +28,37 @@ jobs:
       - name: Run tests
         run: dotnet test FrpBan.slnx --no-restore --verbosity normal
 
-  build-and-release:
+  build-binaries:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
 
     strategy:
       matrix:
         include:
-          - rid: linux-x64
-            os: linux
-            arch: x64
-          - rid: linux-arm64
-            os: linux
-            arch: arm64
+          # Windows
+          - os: windows-latest
+            rid: win-x64
+            artifact: frp-ban-windows-x64.zip
+          - os: windows-latest
+            rid: win-arm64
+            artifact: frp-ban-windows-arm64.zip
+          # macOS
+          - os: macos-latest
+            rid: osx-x64
+            artifact: frp-ban-macos-x64.tar.gz
+          - os: macos-latest
+            rid: osx-arm64
+            artifact: frp-ban-macos-arm64.tar.gz
+          # Linux
+          - os: ubuntu-latest
+            rid: linux-x64
+            artifact: frp-ban-linux-x64.tar.gz
+          - os: ubuntu-latest
+            rid: linux-arm64
+            artifact: frp-ban-linux-arm64.tar.gz
+          - os: ubuntu-latest
+            rid: linux-musl-x64
+            artifact: frp-ban-linux-musl-x64.tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -64,12 +82,240 @@ jobs:
             -p:PublishSingleFile=true \
             -p:PublishTrimmed=false \
             -o ./publish/${{ matrix.rid }}
+        shell: bash
 
-      - name: Archive
-        run: tar -czf frp-ban-${{ matrix.rid }}.tar.gz -C ./publish/${{ matrix.rid }} .
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd ./publish/${{ matrix.rid }}
+          7z a -r ../../${{ matrix.artifact }} .
+        shell: pwsh
 
-      - name: Upload to GitHub Release
+      - name: Archive (Unix)
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.artifact }} -C ./publish/${{ matrix.rid }} .
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 7
+
+  build-linux-packages:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          # Debian/Ubuntu
+          - format: deb
+            arch: amd64
+            rid: linux-x64
+          - format: deb
+            arch: arm64
+            rid: linux-arm64
+          # RPM
+          - format: rpm
+            arch: x86_64
+            rid: linux-x64
+          - format: rpm
+            arch: aarch64
+            rid: linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 11 (preview)
+        run: |
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+
+      - name: Restore
+        run: dotnet restore FrpBan.slnx
+
+      - name: Publish (${{ matrix.rid }})
+        run: |
+          dotnet publish src/FrpBan \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=false \
+            -p:PublishTrimmed=false \
+            -o ./publish/${{ matrix.rid }}
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.format }}" = "deb" ]; then
+            sudo apt-get install -y dpkg-dev
+          else
+            sudo apt-get install -y rpm
+          fi
+
+      - name: Build DEB package
+        if: matrix.format == 'deb'
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ARCH="${{ matrix.arch }}"
+          PACKAGE_NAME="frp-ban_${VERSION}_${ARCH}"
+
+          mkdir -p "${PACKAGE_NAME}/DEBIAN"
+          mkdir -p "${PACKAGE_NAME}/usr/local/bin"
+          mkdir -p "${PACKAGE_NAME}/etc/frp-ban"
+          mkdir -p "${PACKAGE_NAME}/etc/systemd/system"
+
+          cp ./publish/${{ matrix.rid }}/FrpBan "${PACKAGE_NAME}/usr/local/bin/frp-ban"
+          chmod 755 "${PACKAGE_NAME}/usr/local/bin/frp-ban"
+
+          if [ -f "frps.toml.example" ]; then
+            cp frps.toml.example "${PACKAGE_NAME}/etc/frp-ban/frps.toml.example"
+          fi
+
+          cat > "${PACKAGE_NAME}/etc/systemd/system/frp-ban.service" << 'EOF'
+          [Unit]
+          Description=FRP Ban Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/frp-ban
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          cat > "${PACKAGE_NAME}/DEBIAN/control" << EOF
+          Package: frp-ban
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: FRP Ban Maintainers
+          Description: FRP Ban - IP banning service for FRP
+           Automatic IP banning service that monitors FRP logs and bans malicious IPs.
+          EOF
+
+          cat > "${PACKAGE_NAME}/DEBIAN/postinst" << 'EOF'
+          #!/bin/bash
+          set -e
+          systemctl daemon-reload || true
+          echo "FRP Ban installed successfully."
+          echo "To start: sudo systemctl start frp-ban"
+          echo "To enable: sudo systemctl enable frp-ban"
+          EOF
+
+          chmod 755 "${PACKAGE_NAME}/DEBIAN/postinst"
+          dpkg-deb --build "${PACKAGE_NAME}"
+          mv "${PACKAGE_NAME}.deb" "frp-ban-${VERSION}-${ARCH}.deb"
+
+      - name: Build RPM package
+        if: matrix.format == 'rpm'
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ARCH="${{ matrix.arch }}"
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          cat > ~/rpmbuild/SPECS/frp-ban.spec << EOF
+          Name:           frp-ban
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        IP banning service for FRP
+          License:        MIT
+
+          %description
+          Automatic IP banning service that monitors FRP logs and bans malicious IPs.
+
+          %install
+          mkdir -p %{buildroot}/usr/local/bin
+          mkdir -p %{buildroot}/etc/frp-ban
+          mkdir -p %{buildroot}/etc/systemd/system
+
+          install -m 755 $PWD/publish/${{ matrix.rid }}/FrpBan %{buildroot}/usr/local/bin/frp-ban
+
+          if [ -f "$PWD/frps.toml.example" ]; then
+            install -m 644 $PWD/frps.toml.example %{buildroot}/etc/frp-ban/frps.toml.example
+          fi
+
+          cat > %{buildroot}/etc/systemd/system/frp-ban.service << 'SVCEOF'
+          [Unit]
+          Description=FRP Ban Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/frp-ban
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          %files
+          /usr/local/bin/frp-ban
+          /etc/frp-ban/frps.toml.example
+          /etc/systemd/system/frp-ban.service
+
+          %post
+          systemctl daemon-reload || true
+
+          %changelog
+          * $(date "+%a %b %d %Y") FRP Ban - ${VERSION}
+          - Release ${VERSION}
+          EOF
+
+          rpmbuild -bb ~/rpmbuild/SPECS/frp-ban.spec
+          cp ~/rpmbuild/RPMS/${ARCH}/frp-ban-${VERSION}-1.*.${ARCH}.rpm ./frp-ban-${VERSION}-${ARCH}.rpm
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frp-ban-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.${{ matrix.format }}
+          path: frp-ban-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.${{ matrix.format }}
+          retention-days: 7
+
+  create-release:
+    needs: [build-binaries, build-linux-packages]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f -name "frp-ban-*"
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Delete old release
+        continue-on-error: true
+        run: |
+          gh release delete ${{ github.ref_name }} -y
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: frp-ban-${{ matrix.rid }}.tar.gz
-          generate_release_notes: true
+          files: artifacts/*/frp-ban-*
+          body_path: RELEASE_NOTES_1.0.0.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
