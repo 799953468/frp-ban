@@ -175,6 +175,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(any(url.endswith("/assets/links/42") and method == "PUT"
                             for method, url, _ in calls))
         self.assertTrue(all("test-only-token" not in url for _, url, _ in calls))
+        updates = [json.loads(body) for method, url, body in calls
+                   if method == "PUT" and url.endswith("/releases/v1.2.3")]
+        self.assertEqual("v1.2.3", updates[0]["name"])
 
     def test_client_archives_include_runtime_rules_config_and_correct_launcher(self):
         for rid in release.RIDS:

@@ -267,7 +267,7 @@ def gitlab_release(tag, version, destination):
                       "direct_asset_path": f"/{path.name}", "link_type": "package"})
         print(f"Uploaded {path.name}", flush=True)
     description = (ROOT / "packaging/RELEASE_NOTES.md").read_text()
-    body = {"name": f"FRP Ban {tag}", "description": description}
+    body = {"name": tag, "description": description}
     if existing is None:
         request("POST", f"{base}/releases", {**body, "tag_name": tag, "assets": {"links": links}})
     else:

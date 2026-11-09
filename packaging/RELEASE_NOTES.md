@@ -1,4 +1,4 @@
-# FRP Ban v1.1.0
+# v1.1.0
 
 This release adds standalone client packages alongside the server for Windows,
 macOS and Linux on x64 and ARM64. It also includes the TLS, protocol validation,
