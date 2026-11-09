@@ -193,6 +193,14 @@ action:
 
 ## Build & Run
 
+### Release packages
+
+Tagged releases provide Windows `.zip`, macOS `.tar.gz`, and Linux
+`.deb`, `.rpm`, Arch `.pkg.tar.zst`, Alpine `.apk` and portable `.tar.gz` builds for
+x64 and ARM64. These packages contain the server and its .NET runtime.
+See [Release packaging and installation](docs/RELEASING.md) for the full matrix,
+configuration steps and GitHub/GitLab CI runner requirements.
+
 ### Build
 
 ```bash

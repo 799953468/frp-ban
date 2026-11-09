@@ -1,312 +1,58 @@
 default:
-  image: mcr.microsoft.com/dotnet/sdk:10.0
+  image: mcr.microsoft.com/dotnet/sdk:10.0-noble
 
 variables:
-  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
-  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
 
 stages:
   - test
-  - release
+  - build
   - publish
 
-.before_script_template: &dotnet_setup
+.dotnet:
   before_script:
-    - curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
-    - export PATH="$HOME/.dotnet:$PATH"
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates python3
+    - curl --fail --silent --show-error --location https://dot.net/v1/dotnet-install.sh --output /tmp/dotnet-install.sh
+    - bash /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir "$CI_PROJECT_DIR/.dotnet"
+    - export DOTNET_ROOT="$CI_PROJECT_DIR/.dotnet"
+    - export PATH="$DOTNET_ROOT:$CI_PROJECT_DIR/.tools:$PATH"
     - dotnet --version
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Test: Run unit tests on every push
-# ──────────────────────────────────────────────────────────────────────────────
+.release:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
 test:
+  extends: .dotnet
   stage: test
-  rules:
-    - if: '$CI_COMMIT_TAG == null'
-  <<: *dotnet_setup
   script:
-    - dotnet restore FrpBan.slnx
-    - dotnet test FrpBan.slnx --configuration Release --no-restore --verbosity normal
-  coverage: '/^\s*Total\s+\|\s+(\d+\.\d+)%/'
+    - dotnet test FrpBan.slnx -c Release --verbosity normal
+    - python3 -m unittest discover -s scripts/tests -v
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Release Builds: Multi-platform binaries and packages
-# ──────────────────────────────────────────────────────────────────────────────
-.publish_template: &publish_template
-  stage: release
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
-  <<: *dotnet_setup
+build:
+  extends:
+    - .dotnet
+    - .release
+  stage: build
+  needs: [test]
+  parallel:
+    matrix:
+      - RID: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
   script:
-    - dotnet restore FrpBan.slnx
-    - >
-      dotnet publish src/FrpBan
-      -c Release
-      -r ${RID}
-      --self-contained true
-      -p:PublishSingleFile=true
-      -p:PublishTrimmed=false
-      -o ./publish/${RID}
-    - tar -czf frp-ban-${RID}.tar.gz -C ./publish/${RID} .
+    - case "$RID" in linux-*) bash scripts/install-nfpm.sh ;; esac
+    - python3 scripts/release.py build "$RID" "$CI_COMMIT_TAG"
   artifacts:
-    paths:
-      - frp-ban-${RID}.tar.gz
-    expire_in: never
+    name: frp-ban-$CI_COMMIT_TAG-$RID
+    paths: [dist/]
+    expire_in: 7 days
 
-release:linux-x64:
-  <<: *publish_template
-  variables:
-    RID: linux-x64
-
-release:linux-arm64:
-  <<: *publish_template
-  variables:
-    RID: linux-arm64
-
-release:linux-musl-x64:
-  <<: *publish_template
-  variables:
-    RID: linux-musl-x64
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DEB Packages
-# ──────────────────────────────────────────────────────────────────────────────
-.package_deb_template: &package_deb_template
-  stage: release
-  image: debian:bookworm-slim
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
-  before_script:
-    - apt-get update && apt-get install -y curl dpkg-dev
-    - curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
-    - export PATH="$HOME/.dotnet:$PATH"
-  script:
-    - VERSION="${CI_COMMIT_TAG#v}"
-    - dotnet restore FrpBan.slnx
-    - >
-      dotnet publish src/FrpBan
-      -c Release
-      -r ${RID}
-      --self-contained true
-      -p:PublishSingleFile=false
-      -p:PublishTrimmed=false
-      -o ./publish/${RID}
-
-    - PACKAGE_NAME="frp-ban_${VERSION}_${DEB_ARCH}"
-    - mkdir -p "${PACKAGE_NAME}/DEBIAN"
-    - mkdir -p "${PACKAGE_NAME}/usr/local/bin"
-    - mkdir -p "${PACKAGE_NAME}/etc/frp-ban"
-    - mkdir -p "${PACKAGE_NAME}/etc/systemd/system"
-
-    - cp ./publish/${RID}/FrpBan "${PACKAGE_NAME}/usr/local/bin/frp-ban"
-    - chmod 755 "${PACKAGE_NAME}/usr/local/bin/frp-ban"
-
-    - |
-      if [ -f "frps.toml.example" ]; then
-        cp frps.toml.example "${PACKAGE_NAME}/etc/frp-ban/frps.toml.example"
-      fi
-
-    - |
-      cat > "${PACKAGE_NAME}/etc/systemd/system/frp-ban.service" << 'EOF'
-      [Unit]
-      Description=FRP Ban Service
-      After=network.target
-
-      [Service]
-      Type=simple
-      ExecStart=/usr/local/bin/frp-ban
-      Restart=on-failure
-      RestartSec=5s
-
-      [Install]
-      WantedBy=multi-user.target
-      EOF
-
-    - |
-      cat > "${PACKAGE_NAME}/DEBIAN/control" << EOF
-      Package: frp-ban
-      Version: ${VERSION}
-      Section: net
-      Priority: optional
-      Architecture: ${DEB_ARCH}
-      Maintainer: FRP Ban Maintainers
-      Description: FRP Ban - IP banning service for FRP
-       Automatic IP banning service that monitors FRP logs and bans malicious IPs.
-      EOF
-
-    - |
-      cat > "${PACKAGE_NAME}/DEBIAN/postinst" << 'EOF'
-      #!/bin/bash
-      set -e
-      systemctl daemon-reload || true
-      echo "FRP Ban installed successfully."
-      echo "To start: sudo systemctl start frp-ban"
-      echo "To enable: sudo systemctl enable frp-ban"
-      EOF
-
-    - chmod 755 "${PACKAGE_NAME}/DEBIAN/postinst"
-    - dpkg-deb --build "${PACKAGE_NAME}"
-    - mv "${PACKAGE_NAME}.deb" "frp-ban-${VERSION}-${DEB_ARCH}.deb"
-  artifacts:
-    paths:
-      - frp-ban-*.deb
-    expire_in: never
-
-package:deb-amd64:
-  <<: *package_deb_template
-  needs: ["release:linux-x64"]
-  variables:
-    RID: linux-x64
-    DEB_ARCH: amd64
-
-package:deb-arm64:
-  <<: *package_deb_template
-  needs: ["release:linux-arm64"]
-  variables:
-    RID: linux-arm64
-    DEB_ARCH: arm64
-
-# ──────────────────────────────────────────────────────────────────────────────
-# RPM Packages
-# ──────────────────────────────────────────────────────────────────────────────
-.package_rpm_template: &package_rpm_template
-  stage: release
-  image: fedora:latest
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
-  before_script:
-    - dnf install -y curl rpm-build rpmdevtools
-    - curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
-    - export PATH="$HOME/.dotnet:$PATH"
-  script:
-    - VERSION="${CI_COMMIT_TAG#v}"
-    - dotnet restore FrpBan.slnx
-    - >
-      dotnet publish src/FrpBan
-      -c Release
-      -r ${RID}
-      --self-contained true
-      -p:PublishSingleFile=false
-      -p:PublishTrimmed=false
-      -o ./publish/${RID}
-
-    - rpmdev-setuptree
-    - |
-      cat > ~/rpmbuild/SPECS/frp-ban.spec << EOF
-      Name:           frp-ban
-      Version:        ${VERSION}
-      Release:        1%{?dist}
-      Summary:        IP banning service for FRP
-      License:        MIT
-
-      %description
-      Automatic IP banning service that monitors FRP logs and bans malicious IPs.
-
-      %install
-      mkdir -p %{buildroot}/usr/local/bin
-      mkdir -p %{buildroot}/etc/frp-ban
-      mkdir -p %{buildroot}/etc/systemd/system
-
-      install -m 755 ${CI_PROJECT_DIR}/publish/${RID}/FrpBan %{buildroot}/usr/local/bin/frp-ban
-
-      if [ -f "${CI_PROJECT_DIR}/frps.toml.example" ]; then
-        install -m 644 ${CI_PROJECT_DIR}/frps.toml.example %{buildroot}/etc/frp-ban/frps.toml.example
-      fi
-
-      cat > %{buildroot}/etc/systemd/system/frp-ban.service << 'SVCEOF'
-      [Unit]
-      Description=FRP Ban Service
-      After=network.target
-
-      [Service]
-      Type=simple
-      ExecStart=/usr/local/bin/frp-ban
-      Restart=on-failure
-      RestartSec=5s
-
-      [Install]
-      WantedBy=multi-user.target
-      SVCEOF
-
-      %files
-      /usr/local/bin/frp-ban
-      %config(noreplace) /etc/frp-ban/frps.toml.example
-      /etc/systemd/system/frp-ban.service
-
-      %post
-      systemctl daemon-reload || true
-
-      %changelog
-      * $(date "+%a %b %d %Y") FRP Ban - ${VERSION}
-      - Release ${VERSION}
-      EOF
-
-    - rpmbuild -bb ~/rpmbuild/SPECS/frp-ban.spec
-    - cp ~/rpmbuild/RPMS/${RPM_ARCH}/frp-ban-${VERSION}-1.*.${RPM_ARCH}.rpm ./frp-ban-${VERSION}-${RPM_ARCH}.rpm
-  artifacts:
-    paths:
-      - frp-ban-*.rpm
-    expire_in: never
-
-package:rpm-x86_64:
-  <<: *package_rpm_template
-  needs: ["release:linux-x64"]
-  variables:
-    RID: linux-x64
-    RPM_ARCH: x86_64
-
-package:rpm-aarch64:
-  <<: *package_rpm_template
-  needs: ["release:linux-arm64"]
-  variables:
-    RID: linux-arm64
-    RPM_ARCH: aarch64
-
-# ──────────────────────────────────────────────────────────────────────────────
-# GitLab Release
-# ──────────────────────────────────────────────────────────────────────────────
 gitlab-release:
+  extends: .release
   stage: publish
-  image: registry.gitlab.com/gitlab-org/cli:latest
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+  image: python:3.12-slim
   needs:
-    - release:linux-x64
-    - release:linux-arm64
-    - release:linux-musl-x64
-    - package:deb-amd64
-    - package:deb-arm64
-    - package:rpm-x86_64
-    - package:rpm-aarch64
+    - job: build
+      artifacts: true
   script:
-    - VERSION="${CI_COMMIT_TAG#v}"
-    - glab auth login --hostname "$CI_SERVER_HOST" --token "$CI_JOB_TOKEN"
-    - |
-      glab release create "$CI_COMMIT_TAG" \
-        --repo "$CI_PROJECT_PATH" \
-        --name "FRP Ban $CI_COMMIT_TAG - Production Ready" \
-        --notes "Release $CI_COMMIT_TAG
-
-## Download
-
-### Linux Binaries
-- frp-ban-linux-x64.tar.gz
-- frp-ban-linux-arm64.tar.gz
-- frp-ban-linux-musl-x64.tar.gz
-
-### Linux Packages
-- frp-ban-${VERSION}-amd64.deb (Debian/Ubuntu x64)
-- frp-ban-${VERSION}-arm64.deb (Debian/Ubuntu ARM64)
-- frp-ban-${VERSION}-x86_64.rpm (RHEL/Fedora x64)
-- frp-ban-${VERSION}-aarch64.rpm (RHEL/Fedora ARM64)
-
-## Installation
-
-See INSTALLATION.md for detailed setup instructions for all platforms.
-
-## Release Notes
-
-See RELEASE_NOTES_1.0.0.md for complete release information." \
-        frp-ban-*.tar.gz \
-        frp-ban-*.deb \
-        frp-ban-*.rpm
+    - python3 scripts/release.py gitlab "$CI_COMMIT_TAG"

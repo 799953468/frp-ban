@@ -4,105 +4,72 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Setup .NET 11 (preview)
-        run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
-          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
-          echo "DOTNET_NOLOGO=1" >> "$GITHUB_ENV"
-          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
-      - name: Restore
-        run: dotnet restore FrpBan.slnx
-      - name: Run tests
-        run: dotnet test FrpBan.slnx --no-restore --verbosity normal
+      - name: Validate release tag
+        run: python3 scripts/release.py validate "$GITHUB_REF_NAME"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.x'
+          dotnet-quality: preview
+      - run: dotnet test FrpBan.slnx -c Release --verbosity normal
+      - run: python3 -m unittest discover -s scripts/tests -v
 
-  build-binaries:
+  build:
     needs: test
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            rid: win-x64
-          - os: windows-latest
-            rid: win-arm64
-          - os: macos-latest
-            rid: osx-x64
-          - os: macos-latest
-            rid: osx-arm64
-          - os: ubuntu-latest
-            rid: linux-x64
-          - os: ubuntu-latest
-            rid: linux-arm64
-
+        rid: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
     steps:
       - uses: actions/checkout@v4
-      - name: Setup .NET 11 (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.x'
+          dotnet-quality: preview
+      - name: Install Linux packaging tools
+        if: startsWith(matrix.rid, 'linux-')
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile dotnet-install.ps1
-          & .\dotnet-install.ps1 -Channel 11.0 -Quality preview
-          echo "$HOME\.dotnet" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "DOTNET_NOLOGO=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Setup .NET 11 (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
-          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
-          echo "DOTNET_NOLOGO=1" >> "$GITHUB_ENV"
-          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
-      - name: Restore
-        run: dotnet restore FrpBan.slnx
-      - name: Publish ${{ matrix.rid }}
-        shell: bash
-        run: |
-          dotnet publish src/FrpBan \
-            -c Release \
-            -r ${{ matrix.rid }} \
-            --self-contained true \
-            -p:PublishSingleFile=true \
-            -p:PublishTrimmed=false \
-            -o ./publish/${{ matrix.rid }}
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          cd ./publish/${{ matrix.rid }}
-          7z a -r ../../frp-ban-${{ matrix.rid }}.zip .
-      - name: Create archive (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: tar -czf frp-ban-${{ matrix.rid }}.tar.gz -C ./publish/${{ matrix.rid }} .
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          bash scripts/install-nfpm.sh
+          echo "$PWD/.tools" >> "$GITHUB_PATH"
+      - name: Publish and package ${{ matrix.rid }}
+        run: python3 scripts/release.py build "${{ matrix.rid }}" "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v4
         with:
           name: frp-ban-${{ matrix.rid }}
-          path: frp-ban-${{ matrix.rid }}.*
-          retention-days: 1
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
 
   create-release:
-    needs: build-binaries
-    runs-on: ubuntu-latest
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+          pattern: frp-ban-*
+          path: dist
+          merge-multiple: true
+      - name: Verify complete asset set and write checksums
+        run: python3 scripts/release.py checksums "$GITHUB_REF_NAME"
+      - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/frp-ban-*
-          body_path: RELEASE_NOTES.md
+          files: dist/*
+          fail_on_unmatched_files: true
+          body_path: packaging/RELEASE_NOTES.md

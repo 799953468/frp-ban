@@ -30,3 +30,6 @@ jobs:
 
       - name: Run tests
         run: dotnet test FrpBan.slnx --no-restore --verbosity normal
+
+      - name: Test release packaging
+        run: python3 -m unittest discover -s scripts/tests -v

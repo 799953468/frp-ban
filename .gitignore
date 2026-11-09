@@ -9,6 +9,11 @@ obj/
 # Publish output
 publish/
 out/
+dist/
+.tools/
+.dotnet/
+__pycache__/
+dotnet-install.sh
 
 # Runtime data (never commit real bans or logs)
 *.json.bak

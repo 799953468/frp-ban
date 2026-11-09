@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+description="FRP Ban Server"
+command="/opt/frp-ban/FrpBan"
+command_user="frp-ban:frp-ban"
+directory="/etc/frp-ban"
+command_background=true
+pidfile="/run/frp-ban.pid"
+output_log="/var/log/frp-ban/stdout.log"
+error_log="/var/log/frp-ban/stderr.log"
+
+depend() {
+    need net
+}
