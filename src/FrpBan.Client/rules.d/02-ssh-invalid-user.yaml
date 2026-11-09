@@ -1,0 +1,17 @@
+# Invalid SSH User Login Rule
+
+rules:
+  - name: "Invalid User SSH"
+    enabled: true
+    logSource:
+      type: "file"
+      path: "/var/log/auth.log"
+    matching:
+      - type: "regex"
+        pattern: "Invalid user.*from (?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
+    action:
+      type: "threshold"
+      windowSeconds: 300
+      maxMatches: 3
+      banDurationSeconds: 1800
+      reason: "Invalid SSH user login attempts"

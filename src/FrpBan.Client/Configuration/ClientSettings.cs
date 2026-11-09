@@ -32,9 +32,9 @@ public sealed class ClientSettings
     public ReconnectionSettings Reconnection { get; init; } = new();
 
     /// <summary>
-    /// Input method: "stdin" (read from standard input).
+    /// Path to rules configuration file (YAML).
     /// </summary>
-    public string InputMethod { get; init; } = "stdin";
+    public string? RulesPath { get; init; }
 
     /// <summary>
     /// Application log path (for file logging).

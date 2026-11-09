@@ -1,0 +1,17 @@
+# SSH Brute Force Detection Rule
+
+rules:
+  - name: "SSH Brute Force"
+    enabled: true
+    logSource:
+      type: "file"
+      path: "/var/log/auth.log"
+    matching:
+      - type: "regex"
+        pattern: "Failed password.*from (?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
+    action:
+      type: "threshold"
+      windowSeconds: 600
+      maxMatches: 5
+      banDurationSeconds: 3600
+      reason: "SSH brute force detected"

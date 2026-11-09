@@ -36,6 +36,8 @@ var services = new ServiceCollection();
 services.AddLogging(builder => builder.AddSerilog());
 services.AddSingleton(Options.Create(clientSettings));
 services.AddSingleton<ClientConnectionService>();
+services.AddSingleton<RuleMatchEngine>();
+services.AddSingleton<RulesLoader>();
 
 var serviceProvider = services.BuildServiceProvider();
 
@@ -45,9 +47,14 @@ var serviceProvider = services.BuildServiceProvider();
 
 var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
 var connectionService = serviceProvider.GetRequiredService<ClientConnectionService>();
+var ruleMatchEngine = serviceProvider.GetRequiredService<RuleMatchEngine>();
+var rulesLoader = serviceProvider.GetRequiredService<RulesLoader>();
 
 logger.LogInformation("FrpBan Client started");
 logger.LogInformation("Server: {Server}:{Port}", clientSettings.ServerAddress, clientSettings.ServerPort);
+
+// Load rules
+var rules = rulesLoader.LoadRules(clientSettings.RulesPath);
 
 // Handle graceful shutdown
 var cts = new CancellationTokenSource();
@@ -60,9 +67,11 @@ Console.CancelKeyPress += (s, e) =>
 
 try
 {
-    // Connection loop - just maintain the connection
+    // Connection loop with rule monitoring
     await Task.Run(async () =>
     {
+        var logMonitors = new Dictionary<BanRule, LogMonitor>();
+
         while (!cts.Token.IsCancellationRequested)
         {
             try
@@ -76,6 +85,30 @@ try
                     {
                         await connectionService.WaitBeforeRetryAsync(cts.Token);
                         continue;
+                    }
+
+                    // Start log monitors once connected
+                    if (logMonitors.Count == 0 && rules.Count > 0)
+                    {
+                        logger.LogInformation("Starting {Count} log monitor(s)", rules.Count);
+                        foreach (var rule in rules)
+                        {
+                            if (rule.Enabled)
+                            {
+                                async Task OnMatches(List<(string ip, int? duration, string reason)> matches)
+                                {
+                                    foreach (var (ip, duration, reason) in matches)
+                                    {
+                                        logger.LogInformation("Ban triggered: IP={IP}, Rule={Rule}", ip, rule.Name);
+                                        await connectionService.SendBanRequestAsync(ip, reason, duration, cts.Token);
+                                    }
+                                }
+
+                                var monitor = LogMonitor.Create(rule, ruleMatchEngine, OnMatches, serviceProvider.GetRequiredService<ILogger<LogMonitor>>());
+                                _ = monitor.StartAsync(cts.Token); // Start monitoring in background
+                                logMonitors[rule] = monitor;
+                            }
+                        }
                     }
                 }
 
