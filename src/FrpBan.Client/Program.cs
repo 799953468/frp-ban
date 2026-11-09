@@ -1,3 +1,5 @@
+using System.ComponentModel.DataAnnotations;
+using System.Runtime.InteropServices;
 using FrpBan.Client.Configuration;
 using FrpBan.Client.Services;
 using Microsoft.Extensions.Configuration;
@@ -6,155 +8,114 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Serilog;
 
-// -------------------------------------------------------------------------
-// Configuration
-// -------------------------------------------------------------------------
-
 var config = new ConfigurationBuilder()
     .SetBasePath(Directory.GetCurrentDirectory())
-    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+    .AddJsonFile("appsettings.json", optional: false)
     .AddEnvironmentVariables()
     .Build();
-
-var clientSettings = config.GetSection("ClientSettings").Get<ClientSettings>() ?? new ClientSettings();
-
-// -------------------------------------------------------------------------
-// Logging
-// -------------------------------------------------------------------------
-
-Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Information()
-    .Enrich.FromLogContext()
-    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
-    .CreateLogger();
-
-// -------------------------------------------------------------------------
-// DI Container
-// -------------------------------------------------------------------------
+var settings = config.GetSection("ClientSettings").Get<ClientSettings>() ?? new ClientSettings();
+var logging = new LoggerConfiguration().MinimumLevel.Information().Enrich.FromLogContext()
+    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}");
+if (!string.IsNullOrWhiteSpace(settings.AppLogPath))
+    logging.WriteTo.File(settings.AppLogPath, rollingInterval: RollingInterval.Day,
+        rollOnFileSizeLimit: true, fileSizeLimitBytes: 104857600, retainedFileCountLimit: 30);
+Log.Logger = logging.CreateLogger();
 
 var services = new ServiceCollection();
 services.AddLogging(builder => builder.AddSerilog());
-services.AddSingleton(Options.Create(clientSettings));
+services.AddSingleton(Options.Create(settings));
 services.AddSingleton<ClientConnectionService>();
+services.AddSingleton<BanDeliveryService>();
 services.AddSingleton<RuleMatchEngine>();
 services.AddSingleton<RulesLoader>();
-
-var serviceProvider = services.BuildServiceProvider();
-
-// -------------------------------------------------------------------------
-// Main Application Logic
-// -------------------------------------------------------------------------
-
-var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
-var connectionService = serviceProvider.GetRequiredService<ClientConnectionService>();
-var ruleMatchEngine = serviceProvider.GetRequiredService<RuleMatchEngine>();
-var rulesLoader = serviceProvider.GetRequiredService<RulesLoader>();
-
-logger.LogInformation("FrpBan Client started");
-logger.LogInformation("Server: {Server}:{Port}", clientSettings.ServerAddress, clientSettings.ServerPort);
-
-// Load rules
-var rules = rulesLoader.LoadRules(clientSettings.RulesPath);
-
-// Handle graceful shutdown
-var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (s, e) =>
-{
-    e.Cancel = true;
-    logger.LogInformation("Shutdown signal received");
-    cts.Cancel();
-};
+await using var provider = services.BuildServiceProvider();
+using var stopping = new CancellationTokenSource();
+var logger = provider.GetRequiredService<ILogger<Program>>();
+ClientConnectionService? connection = null;
+var monitorTasks = new List<Task>();
+var exitCode = 0;
+ConsoleCancelEventHandler cancel = (_, args) => { args.Cancel = true; stopping.Cancel(); };
+Console.CancelKeyPress += cancel;
+using var termination = OperatingSystem.IsWindows() ? null :
+    PosixSignalRegistration.Create(PosixSignal.SIGTERM, context => { context.Cancel = true; stopping.Cancel(); });
 
 try
 {
-    // Connection loop with rule monitoring
-    await Task.Run(async () =>
+    Validator.ValidateObject(settings, new ValidationContext(settings), validateAllProperties: true);
+    connection = provider.GetRequiredService<ClientConnectionService>();
+    var rules = provider.GetRequiredService<RulesLoader>().LoadRules(settings.RulesPath)
+        .Where(rule => rule.Enabled).ToList();
+    if (rules.Count == 0)
+        throw new InvalidOperationException("No valid enabled rules were loaded.");
+    var engine = provider.GetRequiredService<RuleMatchEngine>();
+    var delivery = provider.GetRequiredService<BanDeliveryService>();
+    monitorTasks.Add(delivery.RunAsync(stopping.Token));
+    var monitorsStarted = false;
+
+    while (!stopping.IsCancellationRequested)
     {
-        var logMonitors = new Dictionary<BanRule, LogMonitor>();
-
-        while (!cts.Token.IsCancellationRequested)
+        if (!connection.IsConnected)
         {
-            try
+            if (!await connection.ConnectAsync(stopping.Token))
             {
-                // Connect
-                if (!connectionService.IsConnected)
+                if (!await connection.WaitBeforeRetryAsync(stopping.Token))
                 {
-                    logger.LogInformation("Connecting to server...");
-                    var connected = await connectionService.ConnectAsync(cts.Token);
-                    if (!connected)
-                    {
-                        await connectionService.WaitBeforeRetryAsync(cts.Token);
-                        continue;
-                    }
-
-                    // Start log monitors once connected
-                    if (logMonitors.Count == 0 && rules.Count > 0)
-                    {
-                        logger.LogInformation("Starting {Count} log monitor(s)", rules.Count);
-                        foreach (var rule in rules)
-                        {
-                            if (rule.Enabled)
-                            {
-                                async Task OnMatches(List<(string ip, int? duration, string reason)> matches)
-                                {
-                                    foreach (var (ip, duration, reason) in matches)
-                                    {
-                                        logger.LogInformation("Ban triggered: IP={IP}, Rule={Rule}", ip, rule.Name);
-                                        await connectionService.SendBanRequestAsync(ip, reason, duration, cts.Token);
-                                    }
-                                }
-
-                                var monitor = LogMonitor.Create(rule, ruleMatchEngine, OnMatches, serviceProvider.GetRequiredService<ILogger<LogMonitor>>());
-                                _ = monitor.StartAsync(cts.Token); // Start monitoring in background
-                                logMonitors[rule] = monitor;
-                            }
-                        }
-                    }
+                    exitCode = 1;
+                    break;
                 }
-
-                // Keep connection alive with health checks
-                while (connectionService.IsConnected && !cts.Token.IsCancellationRequested)
-                {
-                    await Task.Delay(clientSettings.Reconnection.HealthCheckIntervalMs, cts.Token);
-                    var pingResult = await connectionService.SendPingAsync(cts.Token);
-                    if (!pingResult)
-                    {
-                        logger.LogWarning("Health check failed, will reconnect...");
-                        connectionService.Disconnect();
-                    }
-                }
-
-                if (!connectionService.IsConnected)
-                {
-                    logger.LogWarning("Connection lost, will reconnect...");
-                    await connectionService.WaitBeforeRetryAsync(cts.Token);
-                }
+                continue;
             }
-            catch (OperationCanceledException)
+            if (!monitorsStarted)
             {
-                break;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Unexpected error in connection loop");
-                connectionService.Disconnect();
-                await connectionService.WaitBeforeRetryAsync(cts.Token);
+                foreach (var rule in rules)
+                {
+                    async Task OnMatches(List<(string ip, int? duration, string reason)> matches)
+                    {
+                        foreach (var (ip, duration, reason) in matches)
+                            await delivery.EnqueueAsync(ip, reason, duration, stopping.Token);
+                    }
+                    var monitor = LogMonitor.Create(rule, engine, OnMatches,
+                        provider.GetRequiredService<ILogger<LogMonitor>>());
+                    monitorTasks.Add(monitor.StartAsync(stopping.Token));
+                }
+                monitorsStarted = true;
             }
         }
-    }, cts.Token);
+
+        var healthDelay = Task.Delay(settings.Reconnection.HealthCheckIntervalMs, stopping.Token);
+        var completed = await Task.WhenAny(monitorTasks.Append(healthDelay));
+        if (completed != healthDelay)
+        {
+            await completed;
+            throw new InvalidOperationException("A log monitor stopped unexpectedly.");
+        }
+        await healthDelay;
+        if (!await connection.SendPingAsync(stopping.Token))
+        {
+            connection.Disconnect();
+            if (!await connection.WaitBeforeRetryAsync(stopping.Token))
+            {
+                exitCode = 1;
+                break;
+            }
+        }
+    }
 }
-catch (OperationCanceledException)
-{
-    // Expected during shutdown
-}
+catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
 catch (Exception ex)
 {
-    logger.LogError(ex, "Fatal error");
-    Environment.Exit(1);
+    logger.LogError(ex, "Client stopped due to an error");
+    exitCode = 1;
 }
 finally
 {
-    connectionService.Disconnect();
-    logger.LogInformation("FrpBan Client stopped");
+    await stopping.CancelAsync();
+    connection?.Disconnect();
+    try { await Task.WhenAll(monitorTasks); }
+    catch (OperationCanceledException) { }
+    catch (Exception ex) { logger.LogError(ex, "Log monitor failed"); exitCode = 1; }
+    Console.CancelKeyPress -= cancel;
+    logger.LogInformation("FrpBan client stopped");
     await Log.CloseAndFlushAsync();
 }
+return exitCode;

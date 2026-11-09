@@ -1,5 +1,4 @@
 using System.Buffers.Binary;
-using System.Text;
 using System.Text.Json;
 
 namespace FrpBan.Protocol;
@@ -41,22 +40,31 @@ public abstract record Message(MessageType Type)
     /// </summary>
     public static (Message? message, int bytesRead) Deserialize(byte[] buffer, int offset = 0)
     {
+        ArgumentNullException.ThrowIfNull(buffer);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(offset, buffer.Length);
+        return Deserialize(buffer.AsSpan(offset));
+    }
+
+    /// <summary>Parses only the bytes actually received, without copying the frame.</summary>
+    public static (Message? message, int bytesRead) Deserialize(ReadOnlySpan<byte> buffer)
+    {
         // Need at least 5 bytes: type(1) + length(4)
-        if (offset + 5 > buffer.Length)
+        if (buffer.Length < 5)
             return (null, 0);
 
-        var type = (MessageType)buffer[offset];
-        var bodyLength = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(offset + 1, 4));
+        var type = (MessageType)buffer[0];
+        var bodyLength = BinaryPrimitives.ReadUInt32BigEndian(buffer.Slice(1, 4));
 
         // Security: enforce maximum message size (64KB)
         if (bodyLength > MaxBodySize)
             throw new InvalidOperationException($"Message body too large: {bodyLength} bytes (max: {MaxBodySize})");
 
         var totalLength = 5 + (int)bodyLength;
-        if (offset + totalLength > buffer.Length)
+        if (totalLength > buffer.Length)
             return (null, 0); // Incomplete message
 
-        var bodyBytes = buffer.AsSpan(offset + 5, (int)bodyLength);
+        var bodyBytes = buffer.Slice(5, (int)bodyLength);
         var message = DeserializeBody(type, bodyBytes);
 
         return (message, totalLength);
@@ -66,6 +74,13 @@ public abstract record Message(MessageType Type)
     /// Subclasses implement to serialize their specific body content.
     /// </summary>
     protected abstract byte[] SerializeBody();
+
+    private static readonly JsonSerializerOptions JsonOptions = new() { RespectNullableAnnotations = true };
+
+    /// <summary>Deserializes a message directly from UTF-8 with non-nullable field validation.</summary>
+    protected static T DeserializeJson<T>(ReadOnlySpan<byte> body) where T : Message =>
+        JsonSerializer.Deserialize<T>(body, JsonOptions) ?? throw new JsonException("Message body cannot be null.");
+
 
     /// <summary>
     /// Factory method to deserialize body based on message type.
@@ -82,169 +97,5 @@ public abstract record Message(MessageType Type)
             MessageType.Error => ErrorMessage.FromBody(body),
             _ => throw new InvalidOperationException($"Unknown message type: {type}"),
         };
-    }
-}
-
-/// <summary>
-/// Handshake message (client -> server).
-/// </summary>
-public sealed record HelloMessage(
-    string Version,
-    string ClientType,
-    string TokenHash  // SHA256 hash of token
-) : Message(MessageType.Hello)
-{
-    protected override byte[] SerializeBody()
-    {
-        var json = JsonSerializer.Serialize(new
-        {
-            Version,
-            ClientType,
-            TokenHash,
-        });
-        return Encoding.UTF8.GetBytes(json);
-    }
-
-    public static Message FromBody(ReadOnlySpan<byte> body)
-    {
-        var json = Encoding.UTF8.GetString(body);
-        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
-        var root = doc.RootElement;
-
-        return new HelloMessage(
-            root.GetProperty("Version").GetString() ?? "1.0",
-            root.GetProperty("ClientType").GetString() ?? "unknown",
-            root.GetProperty("TokenHash").GetString() ?? ""
-        );
-    }
-}
-
-/// <summary>
-/// Ban request message (client -> server).
-/// </summary>
-public sealed record BanRequestMessage(
-    string Ip,
-    string? Reason,
-    int? DurationSeconds
-) : Message(MessageType.BanRequest)
-{
-    protected override byte[] SerializeBody()
-    {
-        var json = JsonSerializer.Serialize(new
-        {
-            Ip,
-            Reason,
-            DurationSeconds,
-        });
-        return Encoding.UTF8.GetBytes(json);
-    }
-
-    public static Message FromBody(ReadOnlySpan<byte> body)
-    {
-        var json = Encoding.UTF8.GetString(body);
-        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
-        var root = doc.RootElement;
-
-        return new BanRequestMessage(
-            root.GetProperty("Ip").GetString() ?? "",
-            root.TryGetProperty("Reason", out var reason) ? reason.GetString() : null,
-            root.TryGetProperty("DurationSeconds", out var duration) ? duration.GetInt32() : null
-        );
-    }
-}
-
-/// <summary>
-/// Ban response message (server -> client).
-/// </summary>
-public sealed record BanResponseMessage(
-    bool Success,
-    string Message
-) : Message(MessageType.BanResponse)
-{
-    protected override byte[] SerializeBody()
-    {
-        var json = JsonSerializer.Serialize(new { Success, Message });
-        return Encoding.UTF8.GetBytes(json);
-    }
-
-    public static Message FromBody(ReadOnlySpan<byte> body)
-    {
-        var json = Encoding.UTF8.GetString(body);
-        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
-        var root = doc.RootElement;
-
-        return new BanResponseMessage(
-            root.GetProperty("Success").GetBoolean(),
-            root.GetProperty("Message").GetString() ?? ""
-        );
-    }
-}
-
-/// <summary>
-/// Ping message (client -> server).
-/// </summary>
-public sealed record PingMessage(
-    uint SequenceNumber = 0
-) : Message(MessageType.Ping)
-{
-    protected override byte[] SerializeBody()
-    {
-        var buffer = new byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(buffer, SequenceNumber);
-        return buffer;
-    }
-
-    public static Message FromBody(ReadOnlySpan<byte> body)
-    {
-        var seq = body.Length >= 4
-            ? BinaryPrimitives.ReadUInt32BigEndian(body)
-            : 0u;
-        return new PingMessage(seq);
-    }
-}
-
-/// <summary>
-/// Pong response message (server -> client).
-/// </summary>
-public sealed record PongMessage(
-    uint SequenceNumber = 0
-) : Message(MessageType.Pong)
-{
-    protected override byte[] SerializeBody()
-    {
-        var buffer = new byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(buffer, SequenceNumber);
-        return buffer;
-    }
-
-    public static Message FromBody(ReadOnlySpan<byte> body)
-    {
-        var seq = body.Length >= 4
-            ? BinaryPrimitives.ReadUInt32BigEndian(body)
-            : 0u;
-        return new PongMessage(seq);
-    }
-}
-
-/// <summary>
-/// Error message (either direction).
-/// </summary>
-public sealed record ErrorMessage(
-    string ErrorText
-) : Message(MessageType.Error)
-{
-    protected override byte[] SerializeBody()
-    {
-        var json = JsonSerializer.Serialize(new { Error = ErrorText });
-        return Encoding.UTF8.GetBytes(json);
-    }
-
-    public static Message FromBody(ReadOnlySpan<byte> body)
-    {
-        var json = Encoding.UTF8.GetString(body);
-        using var doc = JsonDocument.Parse(json);  // FIX: Dispose JsonDocument
-        return new ErrorMessage(
-            doc.RootElement.GetProperty("Error").GetString() ?? "Unknown error"
-        );
     }
 }

@@ -3,6 +3,8 @@
     <Project Path="src/FrpBan.Protocol/FrpBan.Protocol.csproj" />
     <Project Path="src/FrpBan/FrpBan.csproj" />
     <Project Path="src/FrpBan.Client/FrpBan.Client.csproj" />
-    <Project Path="src/FrpBan.Tests/FrpBan.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FrpBan.Tests/FrpBan.Tests.csproj" />
   </Folder>
 </Solution>

@@ -94,12 +94,10 @@ public class BanServiceTests : IDisposable
         var ip1 = "192.168.1.1";
         var ip2 = "192.168.1.2";
 
-        // Ban two IPs with different durations
-        await service.BanAsync(ip1, "Active ban", 3600);
-        // Create an expired entry manually
         var expiredEntry = new BanEntry(ip2, "Expired ban", DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddSeconds(-1));
-
-        // Add it directly (simulating an expired ban that hasn't been cleaned up yet)
+        await File.WriteAllTextAsync(_tempBanFile, JsonSerializer.Serialize(new[] { expiredEntry }));
+        service.Load();
+        await service.BanAsync(ip1, "Active ban", 3600);
         var bans = service.GetActiveBans();
 
         // Act & Assert - Should only have the active ban

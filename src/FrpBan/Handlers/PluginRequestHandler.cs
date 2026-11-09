@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using FrpBan.Models;
+using FrpBan.Protocol;
 using FrpBan.Services;
 
 namespace FrpBan.Handlers;
@@ -21,13 +22,21 @@ public sealed class PluginRequestHandler(
         logger.LogDebug("Plugin op={Op} reqid={ReqId}", request.Op,
             ctx.Request.Headers["X-Frp-Reqid"]);
 
-        return request.Op switch
+        if (request.Op is "Login" or "NewUserConn" && request.Content.ValueKind != JsonValueKind.Object)
+            return Task.FromResult(PluginResponse.Deny("invalid plugin payload"));
+        try
         {
-            "Login"       => HandleLoginAsync(request),
-            "NewUserConn" => HandleNewUserConnAsync(request),
-            // All other ops (NewProxy, Ping, NewWorkConn, CloseProxy) are allowed.
-            _ => Task.FromResult(PluginResponse.Allow),
-        };
+            return request.Op switch
+            {
+                "Login" => HandleLoginAsync(request),
+                "NewUserConn" => HandleNewUserConnAsync(request),
+                _ => Task.FromResult(PluginResponse.Allow),
+            };
+        }
+        catch (JsonException)
+        {
+            return Task.FromResult(PluginResponse.Deny("invalid plugin payload"));
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -45,6 +54,8 @@ public sealed class PluginRequestHandler(
             return Task.FromResult(PluginResponse.Deny("invalid login payload"));
 
         var ip = ParseIp(content.ClientAddress);
+        if (ip is null)
+            return Task.FromResult(PluginResponse.Deny("invalid client address"));
         if (ip is not null && banService.IsBanned(ip))
         {
             logger.LogWarning("Login rejected — banned IP {Ip} (run_id={RunId})",
@@ -66,6 +77,8 @@ public sealed class PluginRequestHandler(
             return Task.FromResult(PluginResponse.Deny("invalid NewUserConn payload"));
 
         var ip = ParseIp(content.RemoteAddr);
+        if (ip is null)
+            return Task.FromResult(PluginResponse.Deny("invalid remote address"));
         if (ip is not null && banService.IsBanned(ip))
         {
             logger.LogWarning(
@@ -84,17 +97,16 @@ public sealed class PluginRequestHandler(
     /// <summary>
     /// Parses the IP from an "IP:port" string, or returns null on failure.
     /// </summary>
-    private static string? ParseIp(string address)
+    private static string? ParseIp(string? address)
     {
         if (string.IsNullOrWhiteSpace(address)) return null;
 
+        if (IpAddressUtilities.Normalize(address) is { } literal)
+            return literal;
+
         // IPEndPoint.TryParse handles both "1.2.3.4:80" and "[::1]:80".
         if (IPEndPoint.TryParse(address, out var endpoint))
-            return endpoint.Address.ToString();
-
-        // Fallback: address without a port.
-        if (IPAddress.TryParse(address, out var addr))
-            return addr.ToString();
+            return IpAddressUtilities.Normalize(endpoint.Address.ToString());
 
         return null;
     }

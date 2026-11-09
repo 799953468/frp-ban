@@ -12,6 +12,8 @@ namespace FrpBan.Client.Services;
 public sealed class RulesLoader
 {
     private readonly ILogger<RulesLoader> _logger;
+    private readonly IDeserializer _deserializer = new DeserializerBuilder()
+        .WithNamingConvention(CamelCaseNamingConvention.Instance).Build();
 
     public RulesLoader(ILogger<RulesLoader> logger)
     {
@@ -51,6 +53,22 @@ public sealed class RulesLoader
             return rules;
         }
 
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        rules = rules.Where(rule =>
+        {
+            if (rule is null)
+            {
+                _logger.LogError("Ignoring null rule");
+                return false;
+            }
+            var error = RuleValidator.Validate(rule);
+            if (error is not null || !names.Add(rule.Name))
+            {
+                _logger.LogError("Ignoring rule {Name}: {Error}", rule.Name, error ?? "Duplicate rule name");
+                return false;
+            }
+            return true;
+        }).ToList();
         _logger.LogInformation("Loaded {Count} total rule(s)", rules.Count);
         foreach (var rule in rules)
         {
@@ -68,7 +86,7 @@ public sealed class RulesLoader
         {
             var files = Directory.GetFiles(directoryPath, "*.yaml")
                 .Concat(Directory.GetFiles(directoryPath, "*.yml"))
-                .OrderBy(f => f)
+                .OrderBy(f => f, StringComparer.Ordinal)
                 .ToList();
 
             _logger.LogInformation("Found {Count} YAML file(s) in {Path}", files.Count, directoryPath);
@@ -95,11 +113,7 @@ public sealed class RulesLoader
         try
         {
             var yaml = File.ReadAllText(filePath);
-            var deserializer = new DeserializerBuilder()
-                .WithNamingConvention(CamelCaseNamingConvention.Instance)
-                .Build();
-
-            var config = deserializer.Deserialize<RulesConfiguration>(yaml);
+            var config = _deserializer.Deserialize<RulesConfiguration>(yaml);
             if (config?.Rules != null)
             {
                 rules = config.Rules;

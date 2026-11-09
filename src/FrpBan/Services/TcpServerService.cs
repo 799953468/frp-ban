@@ -1,416 +1,273 @@
-using System.Buffers;
-using System.Collections.Concurrent;
 using System.Net;
-using System.Net.Sockets;
 using System.Net.Security;
+using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using FrpBan.Configuration;
 using FrpBan.Protocol;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
+using FrpBan.Protocol.Security;
+using FrpBan.Protocol.Transport;
+using FrpBan.Security;
 using Microsoft.Extensions.Options;
 
 namespace FrpBan.Services;
 
-/// <summary>
-/// TCP server service that listens for client connections over TLS.
-/// Implements binary protocol with connection pooling and rate limiting.
-/// SECURITY: Limited buffer sizes, connection limits, rate limiting.
-/// PERFORMANCE: Uses ArrayPool for buffer management.
-/// </summary>
-public sealed class TcpServerService : IHostedService
+/// <summary>Hosts bounded TLS sessions with mandatory token authentication and per-IP limits.</summary>
+public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDisposable
 {
-    private const int MaxBufferSize = 1024 * 1024; // 1MB per connection
-    private const int MaxConcurrentConnections = 100;
-    private const int ReadBufferSize = 16384; // 16KB
-
     private readonly ILogger<TcpServerService> _logger;
-    private readonly IOptions<PluginSettings> _settings;
+    private readonly PluginSettings _settings;
     private readonly IBanService _banService;
-    private readonly SemaphoreSlim _connectionSemaphore = new(MaxConcurrentConnections);
-    private readonly ConcurrentDictionary<string, RateLimiter> _rateLimiters = new();
-
+    private readonly SemaphoreSlim _connectionSlots;
+    private readonly IpRateLimiter _connectionLimiter;
+    private readonly IpRateLimiter _messageLimiter;
+    private readonly byte[] _tokenHash;
+    // Only the accept loop mutates this set. Stop waits for that loop first.
+    private readonly HashSet<Task> _connections = [];
+    private readonly CancellationTokenSource _stopping = new();
     private TcpListener? _listener;
-    private CancellationTokenSource? _cancellationTokenSource;
     private Task? _listenerTask;
     private X509Certificate2? _serverCertificate;
     private X509Certificate2? _caCertificate;
+    private SslStreamCertificateContext? _certificateContext;
+    private readonly object _lifecycle = new();
+    private Task? _stopTask;
+    private Task? _disposeTask;
 
-    public TcpServerService(
-        ILogger<TcpServerService> logger,
-        IOptions<PluginSettings> settings,
+    internal IPEndPoint? LocalEndpoint => _listener?.LocalEndpoint as IPEndPoint;
+
+    /// <summary>Creates a server using the configured connection and message limits.</summary>
+    public TcpServerService(ILogger<TcpServerService> logger, IOptions<PluginSettings> settings,
         IBanService banService)
     {
         _logger = logger;
-        _settings = settings;
+        _settings = settings.Value;
         _banService = banService;
+        var tls = _settings.Tls ?? new TlsSettings();
+        _connectionSlots = new SemaphoreSlim(tls.MaxConcurrentConnections);
+        _connectionLimiter = new IpRateLimiter(tls.MaxConnectionsPerMinute);
+        _messageLimiter = new IpRateLimiter(tls.MaxMessagesPerMinute);
+        _tokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(_settings.Token));
     }
 
-    public async Task StartAsync(CancellationToken cancellationToken)
+    /// <inheritdoc/>
+    public Task StartAsync(CancellationToken cancellationToken)
     {
-        var tls = _settings.Value.Tls;
+        var tls = _settings.Tls;
         if (tls?.Enabled != true || !tls.TcpListenerEnabled)
-        {
-            _logger.LogInformation("TLS TCP listener is disabled");
-            return;
-        }
+            return Task.CompletedTask;
 
-        try
-        {
-            // Load server certificate
-            if (string.IsNullOrWhiteSpace(tls.CertificatePath))
-                throw new InvalidOperationException("TLS is enabled but CertificatePath is not specified");
+        cancellationToken.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(tls.CertificatePath))
+            throw new InvalidOperationException("TLS requires CertificatePath.");
 
-            _serverCertificate = LoadCertificate(tls.CertificatePath, tls.CertificatePassword, tls.KeyPath);
-            _logger.LogInformation("Loaded server certificate from {Path}", tls.CertificatePath);
+        _serverCertificate = LoadCertificate(tls.CertificatePath, tls.CertificatePassword, tls.KeyPath);
+        if (!_serverCertificate.HasPrivateKey)
+            throw new InvalidOperationException("The server certificate must include its private key.");
+        if (tls.RequireClientCertificate && !string.IsNullOrWhiteSpace(tls.ClientCertificateAuthority))
+            _caCertificate = X509CertificateLoader.LoadCertificateFromFile(tls.ClientCertificateAuthority);
 
-            // Load CA certificate if mTLS is required
-            if (tls.RequireClientCertificate && !string.IsNullOrWhiteSpace(tls.ClientCertificateAuthority))
-            {
-                _caCertificate = X509CertificateLoader.LoadCertificateFromFile(tls.ClientCertificateAuthority);
-                _logger.LogInformation("Loaded CA certificate from {Path}", tls.ClientCertificateAuthority);
-            }
-
-            // Start listening
-            _listener = new TcpListener(IPAddress.Any, tls.Port);
-            _listener.Start();
-            _logger.LogInformation("TCP listener started on port {Port} (max {MaxConnections} concurrent connections)",
-                tls.Port, MaxConcurrentConnections);
-
-            _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _listenerTask = ListenForConnectionsAsync(_cancellationTokenSource.Token);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to start TCP server");
-            throw;
-        }
+        _certificateContext = SslStreamCertificateContext.Create(_serverCertificate, null);
+        _listener = new TcpListener(IPAddress.Any, tls.Port);
+        _listener.Start();
+        _listenerTask = ListenForConnectionsAsync(_stopping.Token);
+        _logger.LogInformation("TLS listener started on port {Port}, limit {Limit}",
+            tls.Port, tls.MaxConcurrentConnections);
+        return Task.CompletedTask;
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken)
+    /// <inheritdoc/>
+    public Task StopAsync(CancellationToken cancellationToken)
     {
-        _cancellationTokenSource?.Cancel();
-        if (_listenerTask != null)
-        {
-            try
-            {
-                await _listenerTask.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected
-            }
-        }
+        lock (_lifecycle)
+            return (_stopTask ??= StopCoreAsync()).WaitAsync(cancellationToken);
+    }
+
+    private async Task StopCoreAsync()
+    {
+        await _stopping.CancelAsync().ConfigureAwait(false);
         _listener?.Stop();
-        _connectionSemaphore?.Dispose();
-        _logger.LogInformation("TCP listener stopped");
+        if (_listenerTask is not null)
+            await _listenerTask.ConfigureAwait(false);
+        await Task.WhenAll(_connections).ConfigureAwait(false);
+        _logger.LogInformation("TLS listener stopped");
     }
 
     private async Task ListenForConnectionsAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
+            TcpClient client;
             try
             {
-                var client = await _listener!.AcceptTcpClientAsync(cancellationToken);
-                var remoteAddress = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-
-                _logger.LogDebug("Client connected from {RemoteAddress}", remoteAddress);
-
-                // Rate limiting check
-                var clientIp = ((IPEndPoint?)client.Client.RemoteEndPoint)?.Address.ToString() ?? "unknown";
-                var rateLimiter = _rateLimiters.GetOrAdd(clientIp, _ => new RateLimiter());
-
-                if (!rateLimiter.AllowRequest())
-                {
-                    _logger.LogWarning("Rate limit exceeded for {RemoteAddress}", remoteAddress);
-                    client.Close();
-                    continue;
-                }
-
-                // Connection pool limit
-                if (!await _connectionSemaphore.WaitAsync(0, cancellationToken))
-                {
-                    _logger.LogWarning("Connection limit reached, rejecting {RemoteAddress}", remoteAddress);
-                    client.Close();
-                    continue;
-                }
-
-                // Handle each client connection in the background
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await HandleClientAsync(client, cancellationToken);
-                    }
-                    finally
-                    {
-                        _connectionSemaphore.Release();
-                    }
-                }, cancellationToken);
+                client = await _listener!.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (cancellationToken.IsCancellationRequested &&
+                                       ex is OperationCanceledException or SocketException or ObjectDisposedException)
             {
                 break;
             }
-            catch (Exception ex)
+            catch (SocketException ex)
             {
-                _logger.LogError(ex, "Error accepting client connection");
+                _logger.LogWarning(ex, "Transient error accepting a TLS connection");
+                try { await Task.Delay(1000, cancellationToken).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { break; }
+                continue;
             }
+
+            var address = IpAddressUtilities.Normalize(
+                ((IPEndPoint?)client.Client.RemoteEndPoint)?.Address.ToString()) ?? "unknown";
+            if (!_connectionLimiter.TryAcquire(address) || !_connectionSlots.Wait(0))
+            {
+                client.Dispose();
+                continue;
+            }
+            _connections.RemoveWhere(task => task.IsCompleted);
+            _connections.Add(HandleClientAsync(client, address, cancellationToken));
         }
     }
 
-    private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task HandleClientAsync(TcpClient client, string address, CancellationToken cancellationToken)
     {
-        var remoteAddress = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-        try
+        using (client)
         {
-            using (client)
-            using (var networkStream = client.GetStream())
+            try
             {
-                // Set read/write timeouts
-                client.SendTimeout = 30000; // 30 seconds
-                client.ReceiveTimeout = 300000; // 5 minutes
-
-                // Upgrade to TLS
-                var sslStream = new SslStream(networkStream, leaveInnerStreamOpen: false);
-
-                var serverCertCollection = new X509Certificate2Collection { _serverCertificate! };
-
-                // Configure TLS options
-                var sslOptions = new SslServerAuthenticationOptions
+                using var stream = new SslStream(client.GetStream(), leaveInnerStreamOpen: false);
+                var tls = _settings.Tls!;
+                using var handshake = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                handshake.CancelAfter(TimeSpan.FromSeconds(tls.HandshakeTimeoutSeconds));
+                var options = new SslServerAuthenticationOptions
                 {
-                    ServerCertificateContext = SslStreamCertificateContext.Create(_serverCertificate!, serverCertCollection),
-                    ClientCertificateRequired = _settings.Value.Tls?.RequireClientCertificate ?? false,
+                    ServerCertificateContext = _certificateContext,
+                    ClientCertificateRequired = tls.RequireClientCertificate,
                     EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                 };
+                if (tls.RequireClientCertificate)
+                    options.RemoteCertificateValidationCallback = (_, certificate, chain, errors) =>
+                        CertificateTrust.Validate(certificate, chain, errors, _caCertificate, serverCertificate: false);
+                await stream.AuthenticateAsServerAsync(options, handshake.Token).ConfigureAwait(false);
 
-                await sslStream.AuthenticateAsServerAsync(sslOptions, cancellationToken);
-                _logger.LogDebug("TLS handshake completed with {RemoteAddress}", remoteAddress);
-
-                // Handle protocol messages
-                await HandleProtocolAsync(sslStream, remoteAddress, cancellationToken);
-            }
-        }
-        catch (AuthenticationException ex)
-        {
-            _logger.LogWarning(ex, "TLS authentication failed with {RemoteAddress}", remoteAddress);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error handling client {RemoteAddress}", remoteAddress);
-        }
-    }
-
-    private async Task HandleProtocolAsync(SslStream sslStream, string remoteAddress, CancellationToken cancellationToken)
-    {
-        var isAuthenticated = false;
-        var receiveBuffer = ArrayPool<byte>.Shared.Rent(MaxBufferSize);
-        var readBuffer = ArrayPool<byte>.Shared.Rent(ReadBufferSize);
-        var receiveBufferSize = 0;
-
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                // Read from stream
-                int bytesRead = await sslStream.ReadAsync(readBuffer.AsMemory(0, ReadBufferSize), cancellationToken);
-                if (bytesRead == 0)
+                var first = await MessageTransport.ReadAsync(stream, handshake.Token).ConfigureAwait(false);
+                if (first is not HelloMessage hello || hello.Version != "1.0" || !ValidateToken(hello.TokenHash))
                 {
-                    _logger.LogDebug("Client {RemoteAddress} disconnected", remoteAddress);
-                    break;
+                    await WriteAsync(stream, new ErrorMessage("Invalid handshake or token"), cancellationToken);
+                    return;
                 }
+                if (!_messageLimiter.TryAcquire(address))
+                    return;
+                // TLS authenticates the server. Do not echo a reusable credential back to the peer.
+                await WriteAsync(stream, new HelloMessage("1.0", "server", ""), cancellationToken);
 
-                // Security: enforce maximum buffer size
-                if (receiveBufferSize + bytesRead > MaxBufferSize)
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    _logger.LogWarning("Buffer overflow attempt from {RemoteAddress}", remoteAddress);
-                    break;
-                }
-
-                // Append to receive buffer
-                Buffer.BlockCopy(readBuffer, 0, receiveBuffer, receiveBufferSize, bytesRead);
-                receiveBufferSize += bytesRead;
-
-                // Process complete messages
-                int offset = 0;
-                while (offset < receiveBufferSize)
-                {
-                    var (message, bytesConsumed) = Message.Deserialize(receiveBuffer, offset);
-                    if (message == null)
-                        break; // Incomplete message, wait for more data
-
-                    offset += bytesConsumed;
-
-                    var response = await HandleMessageAsync(message, remoteAddress, isAuthenticated, cancellationToken);
-                    if (message is HelloMessage)
-                        isAuthenticated = response != null && response is not ErrorMessage;
-
-                    if (response != null)
+                    using var readTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    readTimeout.CancelAfter(TimeSpan.FromSeconds(tls.IdleTimeoutSeconds));
+                    var message = await MessageTransport.ReadAsync(stream, readTimeout.Token).ConfigureAwait(false);
+                    if (message is null)
+                        break;
+                    if (!_messageLimiter.TryAcquire(address))
                     {
-                        var responseBytes = response.Serialize();
-                        await sslStream.WriteAsync(responseBytes, cancellationToken);
+                        await WriteAsync(stream, new ErrorMessage("Message rate limit exceeded"), cancellationToken);
+                        break;
                     }
-
-                    if (response is ErrorMessage errorMsg && errorMsg.ErrorText.Contains("token"))
-                        break; // Disconnect on token error
-                }
-
-                // Remove processed bytes from buffer
-                if (offset > 0)
-                {
-                    Buffer.BlockCopy(receiveBuffer, offset, receiveBuffer, 0, receiveBufferSize - offset);
-                    receiveBufferSize -= offset;
+                    var response = message switch
+                    {
+                        PingMessage ping => new PongMessage(ping.SequenceNumber) as Message,
+                        BanRequestMessage ban => await HandleBanRequestAsync(ban).ConfigureAwait(false),
+                        _ => new ErrorMessage("Unexpected message type"),
+                    };
+                    await WriteAsync(stream, response, cancellationToken).ConfigureAwait(false);
+                    if (response is ErrorMessage)
+                        break;
                 }
             }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected during shutdown
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Protocol error with {RemoteAddress}", remoteAddress);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(receiveBuffer);
-            ArrayPool<byte>.Shared.Return(readBuffer);
+            catch (OperationCanceledException) { }
+            catch (Exception ex) when (ex is AuthenticationException or IOException or
+                                       System.Text.Json.JsonException or InvalidOperationException or
+                                       ArgumentException or KeyNotFoundException)
+            {
+                _logger.LogDebug(ex, "Rejected or disconnected TLS peer {Address}", address);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "TLS session failed for {Address}", address);
+            }
+            finally
+            {
+                _connectionSlots.Release();
+            }
         }
     }
 
-    private async Task<Message?> HandleMessageAsync(
-        Message message,
-        string remoteAddress,
-        bool isAuthenticated,
-        CancellationToken cancellationToken)
+    private bool ValidateToken(string? tokenHash)
     {
-        return message switch
-        {
-            HelloMessage hello => HandleHello(hello, remoteAddress),
-            BanRequestMessage banReq when isAuthenticated => await HandleBanRequestAsync(banReq, remoteAddress, cancellationToken),
-            PingMessage ping => new PongMessage(ping.SequenceNumber),
-            _ when !isAuthenticated => new ErrorMessage("Not authenticated. Send HELLO first."),
-            _ => new ErrorMessage($"Unexpected message type: {message.Type}"),
-        };
-    }
-
-    private Message HandleHello(HelloMessage hello, string remoteAddress)
-    {
-        _logger.LogDebug("HELLO from {RemoteAddress}: version={Version}, type={ClientType}",
-            remoteAddress, hello.Version, hello.ClientType);
-
-        // Verify token hash
-        var tokenHash = ComputeTokenHash(_settings.Value.Token);
-        if (tokenHash != hello.TokenHash)
-        {
-            _logger.LogWarning("Invalid token hash from {RemoteAddress}", remoteAddress);
-            return new ErrorMessage("Invalid token");
-        }
-
-        _logger.LogInformation("Client {RemoteAddress} authenticated", remoteAddress);
-        return new HelloMessage("1.0", "server", tokenHash);
-    }
-
-    private async Task<Message> HandleBanRequestAsync(
-        BanRequestMessage banReq,
-        string remoteAddress,
-        CancellationToken cancellationToken)
-    {
-        _logger.LogDebug("BAN_REQUEST from {RemoteAddress}: IP={Ip}, Reason={Reason}",
-            remoteAddress, banReq.Ip, banReq.Reason);
-
+        if (tokenHash is not { Length: 64 })
+            return false;
         try
         {
-            // Validate IP
-            if (string.IsNullOrWhiteSpace(banReq.Ip) || !System.Net.IPAddress.TryParse(banReq.Ip, out _))
-            {
-                return new BanResponseMessage(false, "Invalid IP address");
-            }
+            return CryptographicOperations.FixedTimeEquals(_tokenHash, Convert.FromHexString(tokenHash));
+        }
+        catch (FormatException) { return false; }
+    }
 
-            // Ban the IP
-            var reason = banReq.Reason ?? "client request";
-            await _banService.BanAsync(banReq.Ip, reason, banReq.DurationSeconds);
-
-            _logger.LogInformation("Banned {Ip} from {RemoteAddress}", banReq.Ip, remoteAddress);
-
-            return new BanResponseMessage(true, $"Banned {banReq.Ip}");
+    private async Task<Message> HandleBanRequestAsync(BanRequestMessage request)
+    {
+        if (IpAddressUtilities.Normalize(request.Ip) is null || request.DurationSeconds is < 0)
+            return new BanResponseMessage(false, "Invalid IP address or duration");
+        if (request.Reason?.Length > 1024)
+            return new BanResponseMessage(false, "Reason exceeds 1024 characters");
+        try
+        {
+            await _banService.BanAsync(request.Ip, request.Reason ?? "client request", request.DurationSeconds)
+                .ConfigureAwait(false);
+            return new BanResponseMessage(true, $"Banned {request.Ip}");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error processing ban request from {RemoteAddress}", remoteAddress);
-            return new BanResponseMessage(false, ex.Message);
+            _logger.LogError(ex, "Failed to ban {Ip}", request.Ip);
+            return new BanResponseMessage(false, "Unable to apply ban");
         }
     }
 
-    private X509Certificate2 LoadCertificate(string certPath, string? password, string? keyPath)
+    private async Task WriteAsync(SslStream stream, Message message, CancellationToken cancellationToken)
     {
-        if (certPath.EndsWith(".pfx", StringComparison.OrdinalIgnoreCase))
-        {
-            return string.IsNullOrWhiteSpace(password)
-                ? X509CertificateLoader.LoadPkcs12FromFile(certPath, null)
-                : X509CertificateLoader.LoadPkcs12FromFile(certPath, password);
-        }
-        else if (certPath.EndsWith(".pem", StringComparison.OrdinalIgnoreCase) ||
-                 certPath.EndsWith(".crt", StringComparison.OrdinalIgnoreCase))
-        {
-            if (string.IsNullOrWhiteSpace(keyPath))
-                throw new InvalidOperationException("KeyPath is required for PEM certificates");
-            return X509Certificate2.CreateFromPemFile(certPath, keyPath);
-        }
-        else
-        {
-            throw new InvalidOperationException($"Unsupported certificate format: {certPath}");
-        }
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(_settings.Tls!.WriteTimeoutSeconds));
+        await stream.WriteAsync(message.Serialize(), timeout.Token).ConfigureAwait(false);
     }
 
-    private string ComputeTokenHash(string token)
+    private static X509Certificate2 LoadCertificate(string path, string? password, string? keyPath)
     {
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
-        return Convert.ToHexString(hash);
-    }
-}
-
-/// <summary>
-/// Simple token bucket rate limiter.
-/// </summary>
-internal sealed class RateLimiter
-{
-    private const int MaxTokens = 10; // Max 10 requests
-    private const int RefillRateMs = 60000; // Per minute
-    private const int TokensPerRefill = 10;
-
-    private int _tokens = MaxTokens;
-    private long _lastRefillTicks = DateTimeOffset.UtcNow.Ticks;
-
-    public bool AllowRequest()
-    {
-        lock (this)
-        {
-            Refill();
-
-            if (_tokens > 0)
-            {
-                _tokens--;
-                return true;
-            }
-
-            return false;
-        }
+        if (path.EndsWith(".pfx", StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(".p12", StringComparison.OrdinalIgnoreCase))
+            return X509CertificateLoader.LoadPkcs12FromFile(path, password);
+        if (string.IsNullOrWhiteSpace(keyPath))
+            throw new InvalidOperationException("PEM certificates require KeyPath.");
+        return X509Certificate2.CreateFromPemFile(path, keyPath);
     }
 
-    private void Refill()
+    /// <inheritdoc/>
+    public void Dispose()
     {
-        var now = DateTimeOffset.UtcNow.Ticks;
-        var elapsedMs = (now - _lastRefillTicks) / TimeSpan.TicksPerMillisecond;
+        DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
 
-        if (elapsedMs >= RefillRateMs)
-        {
-            _tokens = Math.Min(MaxTokens, _tokens + TokensPerRefill);
-            _lastRefillTicks = now;
-        }
+    /// <summary>Drains every active session before disposing certificates and connection slots.</summary>
+    public ValueTask DisposeAsync()
+    {
+        lock (_lifecycle)
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        await StopAsync(CancellationToken.None).ConfigureAwait(false);
+        _serverCertificate?.Dispose();
+        _caCertificate?.Dispose();
+        _stopping.Dispose();
+        _connectionSlots.Dispose();
     }
 }

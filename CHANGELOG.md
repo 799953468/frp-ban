@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Validate complete bounded protocol frames and strict required JSON fields.
+- Enforce custom CA trust, peer names, certificate validity and mTLS client purpose.
+- Add effective handshake/read/write deadlines, bounded per-IP state and message rate limits.
+- Normalize IP representations and reject malformed protected frps callbacks.
+- Authorize HTTP peers before body parsing; bind callbacks to loopback by default.
+- Cache regexes with timeouts; fix the bundled SSH patterns and validate rules at load time.
+- Reject placeholder secrets and invalid nested configuration at startup.
+
+### Reliability and Performance
+
+- Serialize client exchanges and queue pending bans across reconnects with bounded backpressure.
+- Coalesce ban persistence through one worker and atomically replace the ban file.
+- Preserve dirty updates, fail startup on corrupt ban storage, and drain service shutdown.
+- Serialize log tailing, retain partial UTF-8 lines, and handle rotation and oversized input.
+- Bound and expire threshold state; separate JSON conditions from the extracted IP field.
+
+### Structure and Tests
+
+- Centralize build properties and package versions; remove invalid version requests.
+- Split transport messages, shared TLS validation, endpoint mapping and log monitor implementations.
+- Move regression tests to `tests/FrpBan.Tests` and add real TLS/mTLS and HTTP coverage.
+- Include client configuration and rules in build/publish output.
+- Update configuration examples and deployment documentation.
+
 ## [1.0.0] - 2026-11-09
 
 ### Architecture Changes

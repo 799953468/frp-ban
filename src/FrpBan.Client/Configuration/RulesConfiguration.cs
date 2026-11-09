@@ -29,6 +29,9 @@ public sealed class BanRule
     /// Ban action configuration.
     /// </summary>
     public BanAction Action { get; init; } = new();
+
+    /// <summary>Maximum distinct IPs retained for threshold counting.</summary>
+    public int MaxTrackedIps { get; init; } = 10000;
 }
 
 /// <summary>
@@ -63,7 +66,7 @@ public sealed class MatchExpression
     public string Type { get; init; } = "regex";
 
     /// <summary>
-    /// Regex pattern with named groups like (?P&lt;ip&gt;...).
+    /// Regex pattern with a .NET named group (?&lt;ip&gt;...).
     /// </summary>
     public string? Pattern { get; init; }
 
@@ -76,6 +79,9 @@ public sealed class MatchExpression
     /// Expected value for JSON field (optional, null means any value matches).
     /// </summary>
     public string? JsonValue { get; init; }
+
+    /// <summary>IP field path when JsonValue is a condition; defaults to the root "ip" field.</summary>
+    public string? IpJsonPath { get; init; }
 }
 
 /// <summary>

@@ -178,6 +178,7 @@ public class RuleMatchEngineTests
 
         // Assert
         Assert.Single(result1);
+        Assert.Equal("192.168.1.50", result1[0].ip);
 
         // Act - Different status
         var result2 = engine.ProcessLogLine(@"{""ip"":""192.168.1.51"",""status"":""200""}", rule);

@@ -1,10 +1,12 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace FrpBan.Client.Configuration;
 
 /// <summary>
 /// Configuration settings for the frp-ban client.
 /// Bind via appsettings.json section "ClientSettings".
 /// </summary>
-public sealed class ClientSettings
+public sealed class ClientSettings : IValidatableObject
 {
     /// <summary>
     /// Server address (hostname or IP) for client connection.
@@ -40,6 +42,35 @@ public sealed class ClientSettings
     /// Application log path (for file logging).
     /// </summary>
     public string? AppLogPath { get; init; }
+
+    /// <summary>Deadline for TCP, TLS and HELLO together.</summary>
+    public int ConnectionTimeoutSeconds { get; init; } = 15;
+
+    /// <summary>Deadline for a queued protocol request and its response.</summary>
+    public int RequestTimeoutSeconds { get; init; } = 10;
+
+    /// <summary>Maximum queued bans retained in memory during a connection outage.</summary>
+    public int MaxPendingBans { get; init; } = 1024;
+
+    /// <inheritdoc/>
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        if (string.IsNullOrWhiteSpace(ServerAddress) || ServerPort is < 1 or > 65535)
+            yield return new ValidationResult("A valid server address and port are required.");
+        if (string.IsNullOrWhiteSpace(Token) || Token.Length < 32 || Token.StartsWith("CHANGE_ME", StringComparison.OrdinalIgnoreCase))
+            yield return new ValidationResult("Token must be a non-placeholder secret of at least 32 characters.");
+        if (Tls is null || !Tls.Enabled)
+            yield return new ValidationResult("TLS must be enabled.");
+        if (ConnectionTimeoutSeconds is < 1 or > 300 || RequestTimeoutSeconds is < 1 or > 300)
+            yield return new ValidationResult("Connection and request timeouts must be between 1 and 300 seconds.");
+        if (MaxPendingBans is < 1 or > 100000)
+            yield return new ValidationResult("MaxPendingBans must be between 1 and 100000.");
+        if (Reconnection is null || Reconnection.InitialDelayMs < 1 ||
+            Reconnection.MaxDelayMs < Reconnection.InitialDelayMs || Reconnection.MaxRetries < -1 ||
+            !double.IsFinite(Reconnection.BackoffMultiplier) || Reconnection.BackoffMultiplier is < 1 or > 100 ||
+            Reconnection.HealthCheckIntervalMs < 1)
+            yield return new ValidationResult("Invalid reconnection policy.");
+    }
 }
 
 /// <summary>

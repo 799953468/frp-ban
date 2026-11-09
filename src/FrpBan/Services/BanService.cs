@@ -1,202 +1,194 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Threading.Channels;
 using FrpBan.Configuration;
 using FrpBan.Models;
+using FrpBan.Protocol;
 using Microsoft.Extensions.Options;
 
 namespace FrpBan.Services;
 
-/// <summary>
-/// Thread-safe, file-persisted implementation of <see cref="IBanService"/>.
-/// Bans are kept in memory for fast lookup and flushed to disk periodically.
-/// Expired bans are cleaned up automatically.
-/// PERFORMANCE: Uses ConcurrentDictionary for lock-free reads.
-/// </summary>
-public sealed class BanService : IBanService, IDisposable
+/// <summary>Canonical IP bans with a bounded, coalescing, single-writer persistence queue.</summary>
+public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
 {
     private readonly PluginSettings _settings;
     private readonly ILogger<BanService> _logger;
-    private readonly ConcurrentDictionary<string, BanEntry> _bans = new();
-    private readonly Timer _cleanupTimer;
-    private readonly Timer _persistTimer;
-    private int _isDirty; // 0 = clean, 1 = dirty (atomic operations)
-
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    private readonly ConcurrentDictionary<string, BanEntry> _bans = new(StringComparer.Ordinal);
+    private readonly Channel<byte> _changes = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
     {
-        WriteIndented = true,
-    };
+        SingleReader = true,
+        FullMode = BoundedChannelFullMode.DropWrite,
+    });
+    private readonly Timer _cleanupTimer;
+    private readonly Timer _retryTimer;
+    private readonly Task _persistenceTask;
+    private readonly object _lifecycle = new();
+    private Task? _disposeTask;
+    private int _isDirty;
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+    /// <summary>Creates the ban store and starts its single persistence worker.</summary>
     public BanService(IOptions<PluginSettings> settings, ILogger<BanService> logger)
     {
         _settings = settings.Value;
         _logger = logger;
-
-        // Clean up expired bans every 5 minutes
+        _persistenceTask = PersistLoopAsync();
         _cleanupTimer = new Timer(CleanupExpiredBans, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
-
-        // Persist dirty state every 30 seconds (batch writes)
-        _persistTimer = new Timer(PersistIfDirty, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+        _retryTimer = new Timer(_ =>
+        {
+            if (Volatile.Read(ref _isDirty) != 0)
+                _changes.Writer.TryWrite(0);
+        }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
-    // Called once during startup via IHostedService or explicit init.
+    /// <summary>Loads active bans before traffic is accepted; corrupted storage fails startup.</summary>
     public void Load()
     {
-        var path = _settings.BanFilePath;
-        if (!File.Exists(path))
+        if (!File.Exists(_settings.BanFilePath))
             return;
-
-        try
+        using var stream = File.OpenRead(_settings.BanFilePath);
+        var entries = JsonSerializer.Deserialize<List<BanEntry?>>(stream, JsonOptions)
+                      ?? throw new InvalidDataException("Ban file must contain a JSON array.");
+        foreach (var entry in entries)
         {
-            var json = File.ReadAllText(path);
-            var entries = JsonSerializer.Deserialize<List<BanEntry>>(json, JsonOptions);
-            if (entries is null) return;
-
-            foreach (var entry in entries.Where(e => e.IsActive))
-            {
-                _bans.TryAdd(entry.Ip, entry);
-            }
-
-            _logger.LogInformation("Loaded {Count} active bans from {Path}", _bans.Count, path);
+            if (entry is null || !entry.IsActive)
+                continue;
+            var ip = IpAddressUtilities.Normalize(entry.Ip);
+            if (ip is null)
+                throw new InvalidDataException("Ban file contains an invalid IP address.");
+            if (!_bans.ContainsKey(ip) && _bans.Count >= _settings.MaxBanEntries)
+                throw new InvalidDataException("Ban file exceeds MaxBanEntries.");
+            _bans.AddOrUpdate(ip, entry with { Ip = ip }, (_, previous) =>
+                previous.BannedAt > entry.BannedAt ? previous : entry with { Ip = ip });
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to load ban file from {Path}", path);
-        }
+        _logger.LogInformation("Loaded {Count} active bans", _bans.Count);
     }
 
     /// <inheritdoc/>
     public bool IsBanned(string ip)
     {
-        // Lock-free read with ConcurrentDictionary
-        return _bans.TryGetValue(ip, out var entry) && entry.IsActive;
+        if (string.IsNullOrWhiteSpace(ip)) return false;
+        if (_bans.TryGetValue(ip, out var entry)) return entry.IsActive;
+        var key = IpAddressUtilities.Normalize(ip);
+        return key is not null && key != ip && _bans.TryGetValue(key, out entry) && entry.IsActive;
     }
 
     /// <inheritdoc/>
-    public async Task BanAsync(string ip, string reason, int? durationSeconds = null)
+    public Task BanAsync(string ip, string reason, int? durationSeconds = null)
     {
+        var key = IpAddressUtilities.Normalize(ip) ?? throw new ArgumentException("Invalid IP address.", nameof(ip));
+        ArgumentNullException.ThrowIfNull(reason);
+        if (reason.Length > 1024)
+            throw new ArgumentException("Ban reason exceeds 1024 characters.", nameof(reason));
         var duration = durationSeconds ?? _settings.DefaultBanDurationSeconds;
-        var expiresAt = duration > 0
-            ? DateTimeOffset.UtcNow.AddSeconds(duration)
-            : (DateTimeOffset?)null;
-
-        var entry = new BanEntry(ip, reason, DateTimeOffset.UtcNow, expiresAt);
-        _bans[ip] = entry; // ConcurrentDictionary handles thread safety
-
-        _logger.LogWarning("Banned {Ip} — reason: {Reason}, expires: {Expires}",
-            ip, reason, expiresAt?.ToString("o") ?? "never");
-
-        MarkDirty();
-
-        // Force immediate persist for critical operations, but don't block
-        _ = Task.Run(PersistAsync);
-    }
-
-    /// <inheritdoc/>
-    public async Task UnbanAsync(string ip)
-    {
-        bool removed = _bans.TryRemove(ip, out _);
-
-        if (removed)
+        ArgumentOutOfRangeException.ThrowIfNegative(duration);
+        var now = DateTimeOffset.UtcNow;
+        var entry = new BanEntry(key, reason, now, duration == 0 ? null : now.AddSeconds(duration));
+        lock (_lifecycle)
         {
-            _logger.LogInformation("Unbanned {Ip}", ip);
+            ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
+            if (!_bans.ContainsKey(key) && _bans.Count >= _settings.MaxBanEntries)
+                throw new InvalidOperationException("Maximum ban capacity reached.");
+            _bans[key] = entry;
             MarkDirty();
-            _ = Task.Run(PersistAsync);
         }
+        _logger.LogWarning("Banned {Ip}: {Reason}, expires {Expires}", key, reason, entry.ExpiresAt);
+        return Task.CompletedTask;
     }
 
     /// <inheritdoc/>
-    public IReadOnlyList<BanEntry> GetActiveBans()
+    public Task UnbanAsync(string ip)
     {
-        var result = new List<BanEntry>(_bans.Count);
-        foreach (var entry in _bans.Values)
+        var key = IpAddressUtilities.Normalize(ip) ?? throw new ArgumentException("Invalid IP address.", nameof(ip));
+        lock (_lifecycle)
         {
-            if (entry.IsActive)
-                result.Add(entry);
+            ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
+            if (_bans.TryRemove(key, out _))
+                MarkDirty();
         }
-        return result;
+        return Task.CompletedTask;
     }
 
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
+    /// <inheritdoc/>
+    public IReadOnlyList<BanEntry> GetActiveBans() => _bans.Values.Where(entry => entry.IsActive).ToArray();
 
-    /// <summary>
-    /// Atomically marks the service as dirty (needs persist).
-    /// </summary>
-    private void MarkDirty() => Interlocked.Exchange(ref _isDirty, 1);
+    private void MarkDirty()
+    {
+        Interlocked.Exchange(ref _isDirty, 1);
+        _changes.Writer.TryWrite(0);
+    }
 
-    /// <summary>
-    /// Atomically checks and clears the dirty flag.
-    /// </summary>
-    private bool CheckAndClearDirty() => Interlocked.Exchange(ref _isDirty, 0) == 1;
-
-    /// <summary>
-    /// Removes expired bans from memory. Called periodically by timer.
-    /// </summary>
     private void CleanupExpiredBans(object? state)
     {
-        var toRemove = new List<string>();
-
-        foreach (var (ip, entry) in _bans)
-        {
-            if (!entry.IsActive)
-                toRemove.Add(ip);
-        }
-
-        if (toRemove.Count == 0)
-            return;
-
-        foreach (var ip in toRemove)
-        {
-            _bans.TryRemove(ip, out _);
-        }
-
-        _logger.LogInformation("Cleaned up {Count} expired bans", toRemove.Count);
-        MarkDirty();
+        foreach (var pair in _bans)
+            // Compare both key and value so an expiry sweep cannot delete a refreshed ban.
+            if (!pair.Value.IsActive && ((ICollection<KeyValuePair<string, BanEntry>>)_bans).Remove(pair))
+                MarkDirty();
     }
 
-    /// <summary>
-    /// Persists to disk only if there are pending changes. Called periodically by timer.
-    /// </summary>
-    private void PersistIfDirty(object? state)
+    private async Task PersistLoopAsync()
     {
-        if (_isDirty == 1)
+        while (await _changes.Reader.WaitToReadAsync().ConfigureAwait(false))
         {
-            _ = Task.Run(PersistAsync);
+            // Merge bursts of changes instead of scheduling a disk writer per ban.
+            await Task.Delay(100).ConfigureAwait(false);
+            while (_changes.Reader.TryRead(out _)) { }
+            await PersistAsync().ConfigureAwait(false);
         }
     }
 
     private async Task PersistAsync()
     {
+        // Clear before taking the snapshot. Changes during a write stay dirty and queued.
+        if (Interlocked.Exchange(ref _isDirty, 0) == 0)
+            return;
         var path = _settings.BanFilePath;
+        string? temporaryPath = null;
         try
         {
-            var dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
-
-            var snapshot = _bans.Values.ToList();
-            var json = JsonSerializer.Serialize(snapshot, JsonOptions);
-            await File.WriteAllTextAsync(path, json);
-
-            CheckAndClearDirty(); // Atomic clear
+            path = Path.GetFullPath(path);
+            temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var snapshot = GetActiveBans();
+            await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
+                             FileShare.None, 16384, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await JsonSerializer.SerializeAsync(stream, snapshot, JsonOptions).ConfigureAwait(false);
+                await stream.FlushAsync().ConfigureAwait(false);
+            }
+            File.Move(temporaryPath, path, overwrite: true);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to persist ban list to {Path}", path);
+            Interlocked.Exchange(ref _isDirty, 1);
+            _logger.LogError(ex, "Failed to persist bans to {Path}; changes remain pending", path);
         }
-    }
-
-    public void Dispose()
-    {
-        _cleanupTimer?.Dispose();
-        _persistTimer?.Dispose();
-
-        // Final persist on shutdown
-        if (_isDirty == 1)
+        finally
         {
-            PersistAsync().GetAwaiter().GetResult();
+            try { if (temporaryPath is not null) File.Delete(temporaryPath); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
     }
-}
 
+    /// <summary>Drains pending writes; repeated disposal is safe.</summary>
+    public ValueTask DisposeAsync()
+    {
+        lock (_lifecycle)
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        await _cleanupTimer.DisposeAsync().ConfigureAwait(false);
+        await _retryTimer.DisposeAsync().ConfigureAwait(false);
+        _changes.Writer.TryComplete();
+        await _persistenceTask.ConfigureAwait(false);
+        await PersistAsync().ConfigureAwait(false);
+        if (Volatile.Read(ref _isDirty) != 0)
+            throw new IOException("Unable to flush pending bans during shutdown.");
+    }
+
+    /// <summary>Synchronous disposal adapter for callers without an asynchronous lifetime.</summary>
+    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+}

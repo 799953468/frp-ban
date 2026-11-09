@@ -8,7 +8,7 @@ rules:
       path: "/var/log/auth.log"
     matching:
       - type: "regex"
-        pattern: "Failed password.*from (?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
+        pattern: "Failed password.*from (?<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
     action:
       type: "threshold"
       windowSeconds: 600

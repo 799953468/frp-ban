@@ -1,342 +1,220 @@
-using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using FrpBan.Client.Configuration;
 using FrpBan.Protocol;
+using FrpBan.Protocol.Security;
+using FrpBan.Protocol.Transport;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace FrpBan.Client.Services;
 
-/// <summary>
-/// Manages TLS connection to frp-ban server with auto-reconnect capability.
-/// Implements binary protocol for communication.
-/// </summary>
-public sealed class ClientConnectionService
+/// <summary>Serializes TLS exchanges so health checks and bans cannot consume each other's replies.</summary>
+public sealed class ClientConnectionService : IDisposable
 {
     private readonly ClientSettings _settings;
     private readonly ILogger<ClientConnectionService> _logger;
+    private readonly SemaphoreSlim _exchanges = new(1, 1);
+    private readonly object _state = new();
+    private readonly string _tokenHash;
     private SslStream? _sslStream;
     private TcpClient? _tcpClient;
-    private bool _isConnected;
+    private volatile bool _isConnected;
     private int _reconnectAttempts;
     private int _currentDelayMs;
     private X509Certificate2? _clientCertificate;
     private X509Certificate2? _caCertificate;
     private uint _pingSequence;
+    private int _disposed;
 
+    /// <summary>Creates a connection manager with bounded request deadlines.</summary>
     public ClientConnectionService(IOptions<ClientSettings> settings, ILogger<ClientConnectionService> logger)
     {
         _settings = settings.Value;
         _logger = logger;
-        _isConnected = false;
-        _reconnectAttempts = 0;
         _currentDelayMs = _settings.Reconnection.InitialDelayMs;
-        _pingSequence = 0;
+        _tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(_settings.Token)));
     }
 
+    /// <summary>Indicates whether the HELLO exchange completed successfully.</summary>
     public bool IsConnected => _isConnected;
 
-    /// <summary>
-    /// Connects to the server with TLS handshake.
-    /// </summary>
+    /// <summary>Connects, validates TLS, and authenticates within one deadline.</summary>
     public async Task<bool> ConnectAsync(CancellationToken cancellationToken)
     {
+        await _exchanges.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // Load certificates
-            if (_clientCertificate == null)
-                _clientCertificate = LoadClientCertificate();
-            if (_caCertificate == null && _settings.Tls.CaCertificatePath != null)
-                _caCertificate = X509CertificateLoader.LoadCertificateFromFile(_settings.Tls.CaCertificatePath);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            Disconnect();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(_settings.ConnectionTimeoutSeconds));
+            if (!string.IsNullOrWhiteSpace(_settings.Tls.ClientCertificatePath))
+                _clientCertificate ??= X509CertificateLoader.LoadPkcs12FromFile(
+                    _settings.Tls.ClientCertificatePath, _settings.Tls.ClientCertificatePassword);
+            if (!string.IsNullOrWhiteSpace(_settings.Tls.CaCertificatePath))
+                _caCertificate ??= X509CertificateLoader.LoadCertificateFromFile(_settings.Tls.CaCertificatePath);
 
-            // Connect TCP
-            _tcpClient = new TcpClient();
-            await _tcpClient.ConnectAsync(_settings.ServerAddress, _settings.ServerPort, cancellationToken);
-            _logger.LogInformation("Connected to {Server}:{Port}", _settings.ServerAddress, _settings.ServerPort);
-
-            // Upgrade to TLS
-            var networkStream = _tcpClient.GetStream();
-
-            // For client, we can use a RemoteCertificateValidationCallback in SslStream
-            var sslStream = new SslStream(
-                networkStream,
-                leaveInnerStreamOpen: false,
-                userCertificateValidationCallback: ValidateServerCertificate
-            );
-
-            var clientCertCollection = new X509CertificateCollection();
-            if (_clientCertificate != null)
-                clientCertCollection.Add(_clientCertificate);
-
-            var sslOptions = new SslClientAuthenticationOptions
+            var client = new TcpClient();
+            lock (_state) { _tcpClient = client; }
+            await client.ConnectAsync(_settings.ServerAddress, _settings.ServerPort, timeout.Token).ConfigureAwait(false);
+            var stream = new SslStream(client.GetStream(), false, ValidateServerCertificate);
+            lock (_state) { _sslStream = stream; }
+            var certificates = new X509CertificateCollection();
+            if (_clientCertificate is not null)
+                certificates.Add(_clientCertificate);
+            await stream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
-                ClientCertificates = clientCertCollection,
                 TargetHost = _settings.ServerAddress,
+                ClientCertificates = certificates,
                 EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-            };
-
-            await sslStream.AuthenticateAsClientAsync(sslOptions, cancellationToken);
-            _sslStream = sslStream;
-            _logger.LogInformation("TLS handshake completed");
-
-            // Send HELLO
-            var tokenHash = ComputeTokenHash(_settings.Token);
-            var hello = new HelloMessage("1.0", "frp-ban-client", tokenHash);
-            var helloBytes = hello.Serialize();
-            await _sslStream.WriteAsync(helloBytes, 0, helloBytes.Length, cancellationToken);
-            _logger.LogDebug("Sent HELLO handshake");
-
-            // Receive HELLO response
-            var buffer = new byte[1024];
-            int bytesRead = await _sslStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-            if (bytesRead > 0)
+            }, timeout.Token).ConfigureAwait(false);
+            await stream.WriteAsync(new HelloMessage("1.0", "frp-ban-client", _tokenHash).Serialize(), timeout.Token)
+                .ConfigureAwait(false);
+            var reply = await MessageTransport.ReadAsync(stream, timeout.Token).ConfigureAwait(false);
+            if (reply is not HelloMessage { Version: "1.0", ClientType: "server" })
+                throw new InvalidDataException("Server rejected HELLO.");
+            lock (_state)
             {
-                var (response, _) = Message.Deserialize(buffer, 0);
-                if (response is HelloMessage && !(response is ErrorMessage))
-                {
-                    _isConnected = true;
-                    _reconnectAttempts = 0;
-                    _currentDelayMs = _settings.Reconnection.InitialDelayMs;
-                    _logger.LogInformation("Successfully authenticated with server");
-                    return true;
-                }
+                if (!ReferenceEquals(_sslStream, stream))
+                    return false;
+                _isConnected = true;
             }
-
-            _logger.LogError("Invalid HELLO response from server");
-            Disconnect();
-            return false;
+            _reconnectAttempts = 0;
+            _currentDelayMs = _settings.Reconnection.InitialDelayMs;
+            _logger.LogInformation("Authenticated with {Server}:{Port}", _settings.ServerAddress, _settings.ServerPort);
+            return true;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _logger.LogInformation("Connection attempt cancelled");
             Disconnect();
-            return false;
+            throw;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Connection attempt failed");
+            _logger.LogWarning(ex, "Connection or authentication failed");
             Disconnect();
             return false;
         }
+        finally { _exchanges.Release(); }
     }
 
-    /// <summary>
-    /// Disconnects from the server.
-    /// </summary>
+    /// <summary>Closes the current session; a pending exchange is interrupted safely.</summary>
     public void Disconnect()
     {
-        _isConnected = false;
-        _sslStream?.Dispose();
-        _tcpClient?.Dispose();
-        _sslStream = null;
-        _tcpClient = null;
-        _logger.LogDebug("Disconnected from server");
-    }
-
-    /// <summary>
-    /// Sends a ban request to the server.
-    /// </summary>
-    public async Task<bool> SendBanRequestAsync(string ip, string? reason, int? durationSeconds, CancellationToken cancellationToken)
-    {
-        if (!_isConnected || _sslStream == null)
+        lock (_state)
         {
-            _logger.LogWarning("Cannot send ban request: not connected");
-            return false;
-        }
-
-        try
-        {
-            var banReq = new BanRequestMessage(ip, reason, durationSeconds);
-            var banReqBytes = banReq.Serialize();
-            await _sslStream.WriteAsync(banReqBytes, 0, banReqBytes.Length, cancellationToken);
-            _logger.LogDebug("Sent BAN_REQUEST: IP={Ip}", ip);
-
-            // Read response
-            var buffer = new byte[1024];
-            int bytesRead = await _sslStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-            if (bytesRead > 0)
-            {
-                var (response, _) = Message.Deserialize(buffer, 0);
-                if (response is BanResponseMessage banResp)
-                {
-                    if (banResp.Success)
-                    {
-                        _logger.LogInformation("Ban request successful: {Message}", banResp.Message);
-                        return true;
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Ban request failed: {Message}", banResp.Message);
-                        return false;
-                    }
-                }
-            }
-
-            _logger.LogError("Invalid response to ban request");
-            return false;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error sending ban request");
             _isConnected = false;
-            return false;
+            _sslStream?.Dispose();
+            _tcpClient?.Dispose();
+            _sslStream = null;
+            _tcpClient = null;
         }
     }
 
-    /// <summary>
-    /// Sends a PING health check message.
-    /// </summary>
-    public async Task<bool> SendPingAsync(CancellationToken cancellationToken)
+    /// <summary>Sends a ban and waits for its corresponding response.</summary>
+    public async Task<bool> SendBanRequestAsync(string ip, string? reason, int? durationSeconds,
+        CancellationToken cancellationToken)
     {
-        if (!_isConnected || _sslStream == null)
-            return false;
-
-        try
+        var response = await ExchangeAsync(new BanRequestMessage(ip, reason, durationSeconds), cancellationToken)
+            .ConfigureAwait(false);
+        if (response is BanResponseMessage ban)
         {
-            _pingSequence++;
-            var ping = new PingMessage(_pingSequence);
-            var pingBytes = ping.Serialize();
-            await _sslStream.WriteAsync(pingBytes, 0, pingBytes.Length, cancellationToken);
-
-            // Read PONG response
-            var buffer = new byte[256];
-            int bytesRead = await _sslStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-            if (bytesRead > 0)
-            {
-                var (response, _) = Message.Deserialize(buffer, 0);
-                if (response is PongMessage pong && pong.SequenceNumber == _pingSequence)
-                {
-                    _logger.LogDebug("Received PONG with sequence {Seq}", pong.SequenceNumber);
-                    return true;
-                }
-            }
-
-            _logger.LogWarning("No PONG response");
-            return false;
+            if (!ban.Success)
+                _logger.LogWarning("Ban request rejected: {Message}", ban.Message);
+            return ban.Success;
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Health check failed");
-            _isConnected = false;
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Waits before retrying connection, with exponential backoff.
-    /// </summary>
-    public async Task WaitBeforeRetryAsync(CancellationToken cancellationToken)
-    {
-        var maxRetries = _settings.Reconnection.MaxRetries;
-        if (maxRetries >= 0 && _reconnectAttempts >= maxRetries)
-        {
-            _logger.LogError("Maximum reconnection attempts reached ({Attempts}), giving up", maxRetries);
-            return;
-        }
-
-        _reconnectAttempts++;
-        var delayMs = Math.Min(_currentDelayMs, _settings.Reconnection.MaxDelayMs);
-        _logger.LogInformation("Reconnecting in {Delay}ms (attempt {Attempt})", delayMs, _reconnectAttempts);
-
-        try
-        {
-            await Task.Delay(delayMs, cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected during shutdown
-        }
-
-        // Increase delay for next attempt
-        _currentDelayMs = (int)(_currentDelayMs * _settings.Reconnection.BackoffMultiplier);
-    }
-
-    private bool ValidateServerCertificate(
-        object sender,
-        X509Certificate? certificate,
-        X509Chain? chain,
-        SslPolicyErrors sslPolicyErrors)
-    {
-        // Security: Production check - never disable validation in production
-        var isProduction = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") != "Development";
-
-        if (!_settings.Tls.ValidateServerCertificate)
-        {
-            if (isProduction)
-            {
-                _logger.LogError("SECURITY: Cannot disable certificate validation in production");
-                return false;
-            }
-            _logger.LogWarning("Server certificate validation disabled (development mode only)");
-            return true;
-        }
-
-        if (certificate == null)
-        {
-            _logger.LogError("Server did not provide certificate");
-            return false;
-        }
-
-        // If self-signed certificates are allowed (with explicit configuration)
-        if (_settings.Tls.AllowSelfSignedCertificates &&
-            sslPolicyErrors == SslPolicyErrors.RemoteCertificateChainErrors)
-        {
-            _logger.LogWarning("Accepting self-signed server certificate: {Subject}", certificate.Subject);
-            return true;
-        }
-
-        // Validate against CA if provided
-        if (_caCertificate != null && chain != null)
-        {
-            chain.ChainPolicy.ExtraStore.Add(_caCertificate);
-            chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
-            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-
-            if (chain.Build(new X509Certificate2(certificate)))
-            {
-                _logger.LogInformation("Server certificate validated against CA");
-                return true;
-            }
-        }
-
-        // Standard validation
-        if (sslPolicyErrors == SslPolicyErrors.None)
-        {
-            _logger.LogInformation("Server certificate validated");
-            return true;
-        }
-
-        _logger.LogError("Server certificate validation failed: {Errors}", sslPolicyErrors);
         return false;
     }
 
-    private X509Certificate2 LoadClientCertificate()
+    /// <summary>Sends a health check and verifies the matching sequence number.</summary>
+    public async Task<bool> SendPingAsync(CancellationToken cancellationToken)
     {
-        var certPath = _settings.Tls.ClientCertificatePath;
-        if (string.IsNullOrWhiteSpace(certPath))
-            throw new InvalidOperationException("Client certificate path is not configured");
-
-        if (!certPath.EndsWith(".pfx", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Only .pfx certificates are supported");
-
-        var cert = string.IsNullOrWhiteSpace(_settings.Tls.ClientCertificatePassword)
-            ? X509CertificateLoader.LoadPkcs12FromFile(certPath, null)
-            : X509CertificateLoader.LoadPkcs12FromFile(certPath, _settings.Tls.ClientCertificatePassword);
-
-        _logger.LogInformation("Loaded client certificate from {Path}", certPath);
-        return cert;
+        var sequence = unchecked((uint)Interlocked.Increment(ref _pingSequence));
+        return await ExchangeAsync(new PingMessage(sequence), cancellationToken).ConfigureAwait(false)
+            is PongMessage pong && pong.SequenceNumber == sequence;
     }
 
-    private string ComputeTokenHash(string token)
+    private async Task<Message?> ExchangeAsync(Message request, CancellationToken cancellationToken)
     {
-        using (var sha256 = SHA256.Create())
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(_settings.RequestTimeoutSeconds));
+        // Include queue time in the deadline so callers cannot build an unbounded wait queue.
+        var acquired = false;
+        try
         {
-            var hash = sha256.ComputeHash(System.Text.Encoding.UTF8.GetBytes(token));
-            return Convert.ToHexString(hash);
+            await _exchanges.WaitAsync(timeout.Token).ConfigureAwait(false);
+            acquired = true;
+            var stream = _sslStream;
+            if (!_isConnected || stream is null)
+                return null;
+            await stream.WriteAsync(request.Serialize(), timeout.Token).ConfigureAwait(false);
+            var response = await MessageTransport.ReadAsync(stream, timeout.Token).ConfigureAwait(false);
+            if (response is BanResponseMessage && request is BanRequestMessage ||
+                response is PongMessage pong && request is PingMessage ping && pong.SequenceNumber == ping.SequenceNumber)
+                return response;
+            throw new InvalidDataException("Unexpected server response.");
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (acquired) Disconnect();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Protocol exchange failed");
+            if (acquired) Disconnect();
+            return null;
+        }
+        finally { if (acquired) _exchanges.Release(); }
+    }
+
+    /// <summary>Waits with capped exponential backoff; returns false when retries are exhausted.</summary>
+    public async Task<bool> WaitBeforeRetryAsync(CancellationToken cancellationToken)
+    {
+        if (_settings.Reconnection.MaxRetries >= 0 && _reconnectAttempts >= _settings.Reconnection.MaxRetries)
+        {
+            _logger.LogError("Maximum reconnection attempts reached");
+            return false;
+        }
+        _reconnectAttempts++;
+        var delay = Math.Min(_currentDelayMs, _settings.Reconnection.MaxDelayMs);
+        _logger.LogInformation("Reconnecting in {Delay}ms (attempt {Attempt})", delay, _reconnectAttempts);
+        await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        _currentDelayMs = (int)Math.Min(_settings.Reconnection.MaxDelayMs,
+            delay * _settings.Reconnection.BackoffMultiplier);
+        return true;
+    }
+
+    private bool ValidateServerCertificate(object sender, X509Certificate? certificate,
+        X509Chain? chain, SslPolicyErrors errors)
+    {
+        var environment = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ??
+                          Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT");
+        var development = string.Equals(environment, "Development", StringComparison.OrdinalIgnoreCase);
+        if (!_settings.Tls.ValidateServerCertificate)
+            return development && certificate is not null;
+        if (_settings.Tls.AllowSelfSignedCertificates && development && _caCertificate is null &&
+            certificate is not null && certificate.Subject == certificate.Issuer)
+        {
+            using var authority = X509CertificateLoader.LoadCertificate(certificate.GetRawCertData());
+            return CertificateTrust.Validate(certificate, chain, errors, authority, serverCertificate: true);
+        }
+        return CertificateTrust.Validate(certificate, chain, errors, _caCertificate, serverCertificate: true);
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        Disconnect();
+        _clientCertificate?.Dispose();
+        _caCertificate?.Dispose();
+        _exchanges.Dispose();
     }
 }

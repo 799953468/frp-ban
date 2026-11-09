@@ -8,7 +8,7 @@ rules:
       path: "/var/log/auth.log"
     matching:
       - type: "regex"
-        pattern: "Invalid user.*from (?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
+        pattern: "Invalid user.*from (?<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"
     action:
       type: "threshold"
       windowSeconds: 300

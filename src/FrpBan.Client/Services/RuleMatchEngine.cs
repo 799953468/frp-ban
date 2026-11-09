@@ -1,203 +1,170 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using FrpBan.Client.Configuration;
+using FrpBan.Client.Matching;
+using FrpBan.Protocol;
 using Microsoft.Extensions.Logging;
 
 namespace FrpBan.Client.Services;
 
-/// <summary>
-/// Rule matching engine for detecting ban conditions.
-/// Supports regex patterns and JSON field matching.
-/// </summary>
-public sealed class RuleMatchEngine
+/// <summary>Matches bounded log lines using cached regexes and isolated, synchronized rule state.</summary>
+public sealed class RuleMatchEngine(ILogger<RuleMatchEngine> logger, TimeProvider? timeProvider = null)
 {
-    private readonly ILogger<RuleMatchEngine> _logger;
-    private readonly Dictionary<string, RuleState> _ruleStates = new();
+    /// <summary>Maximum accepted log-line length in characters.</summary>
+    public const int MaxLogLineLength = 65536;
+    private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
+    private readonly ConditionalWeakTable<BanRule, RuleState> _states = new();
 
-    public RuleMatchEngine(ILogger<RuleMatchEngine> logger)
-    {
-        _logger = logger;
-    }
-
-    /// <summary>
-    /// Processes a log line and returns ban requests if rules match.
-    /// </summary>
-    public List<(string ip, int? durationSeconds, string reason)> ProcessLogLine(
-        string logLine,
-        BanRule rule)
+    /// <summary>Returns canonical IP ban requests for a single complete log line.</summary>
+    public List<(string ip, int? durationSeconds, string reason)> ProcessLogLine(string logLine, BanRule rule)
     {
         var results = new List<(string ip, int? durationSeconds, string reason)>();
-
-        if (!rule.Enabled)
+        if (!rule.Enabled || logLine.Length > MaxLogLineLength || rule.Action.BanDurationSeconds < 0)
+            return results;
+        var ips = ExtractIps(logLine, rule.Matching);
+        if (rule.Action.Type == "immediate")
+        {
+            foreach (var ip in ips)
+                results.Add((ip, rule.Action.BanDurationSeconds, rule.Action.Reason));
+            return results;
+        }
+        if (rule.Action.Type != "threshold" || rule.Action.MaxMatches < 1 || rule.Action.WindowSeconds < 1)
             return results;
 
-        try
+        var state = _states.GetValue(rule, _ => new RuleState());
+        var now = _time.GetUtcNow();
+        var cutoff = now.AddSeconds(-rule.Action.WindowSeconds);
+        lock (state.Gate)
         {
-            // Try to extract IP from log line using match expressions
-            var ips = ExtractIpsFromLog(logLine, rule.Matching);
-            if (ips.Count == 0)
-                return results; // No match
-
-            _logger.LogDebug("Rule '{Rule}' matched IP(s): {IPs}", rule.Name, string.Join(",", ips));
-
-            // Get or create rule state
-            var stateKey = rule.Name;
-            if (!_ruleStates.TryGetValue(stateKey, out var state))
+            if (now >= state.NextCleanup)
             {
-                state = new RuleState();
-                _ruleStates[stateKey] = state;
+                foreach (var pair in state.Matches.ToArray())
+                {
+                    Prune(pair.Value, cutoff);
+                    if (pair.Value.Count == 0)
+                        state.Matches.Remove(pair.Key);
+                }
+                state.NextCleanup = now.AddSeconds(Math.Min(rule.Action.WindowSeconds, 60));
+                state.CapacityWarningLogged = false;
             }
-
-            // Process each matched IP
             foreach (var ip in ips)
             {
-                var banRequest = ProcessIpMatch(ip, rule, state);
-                if (banRequest.HasValue)
-                    results.Add(banRequest.Value);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing rule '{Rule}' against log line", rule.Name);
-        }
-
-        return results;
-    }
-
-    private List<string> ExtractIpsFromLog(string logLine, List<MatchExpression> expressions)
-    {
-        var ips = new List<string>();
-
-        foreach (var expr in expressions)
-        {
-            if (expr.Type == "regex" && expr.Pattern != null)
-            {
-                ips.AddRange(ExtractIpsFromRegex(logLine, expr.Pattern));
-            }
-            else if (expr.Type == "json" && expr.JsonPath != null)
-            {
-                ips.AddRange(ExtractIpsFromJson(logLine, expr.JsonPath, expr.JsonValue));
-            }
-        }
-
-        return ips.Distinct().ToList();
-    }
-
-    private List<string> ExtractIpsFromRegex(string logLine, string pattern)
-    {
-        var ips = new List<string>();
-        try
-        {
-            var regex = new Regex(pattern, RegexOptions.Compiled);
-            var match = regex.Match(logLine);
-
-            if (match.Success && match.Groups.TryGetValue("ip", out var ipGroup))
-            {
-                var ip = ipGroup.Value;
-                if (!string.IsNullOrWhiteSpace(ip))
-                    ips.Add(ip);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Invalid regex pattern: {Pattern}", pattern);
-        }
-
-        return ips;
-    }
-
-    private List<string> ExtractIpsFromJson(string logLine, string jsonPath, string? expectedValue)
-    {
-        var ips = new List<string>();
-        try
-        {
-            var doc = JsonDocument.Parse(logLine);
-            var root = doc.RootElement;
-
-            // Navigate JSON path
-            var value = NavigateJsonPath(root, jsonPath);
-            if (value.HasValue)
-            {
-                var stringValue = value.Value.GetString();
-                if (!string.IsNullOrWhiteSpace(stringValue))
+                if (!state.Matches.TryGetValue(ip, out var matches))
                 {
-                    // If expectedValue is set, only match if it matches
-                    if (expectedValue == null || stringValue.Equals(expectedValue, StringComparison.OrdinalIgnoreCase))
+                    if (state.Matches.Count >= rule.MaxTrackedIps)
                     {
-                        ips.Add(stringValue);
+                        if (!state.CapacityWarningLogged)
+                            logger.LogWarning("Rule {Rule} reached its tracked IP limit", rule.Name);
+                        state.CapacityWarningLogged = true;
+                        continue;
                     }
+                    state.Matches[ip] = matches = new Queue<DateTimeOffset>();
+                }
+                Prune(matches, cutoff);
+                matches.Enqueue(now);
+                if (matches.Count >= rule.Action.MaxMatches)
+                {
+                    state.Matches.Remove(ip);
+                    results.Add((ip, rule.Action.BanDurationSeconds, rule.Action.Reason));
                 }
             }
         }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "Failed to parse as JSON or navigate path '{Path}'", jsonPath);
-        }
-
-        return ips;
+        return results;
     }
 
-    private JsonElement? NavigateJsonPath(JsonElement element, string path)
+    private HashSet<string> ExtractIps(string line, List<MatchExpression> expressions)
     {
-        var parts = path.Split('.');
-        var current = element;
-
-        foreach (var part in parts)
+        var ips = new HashSet<string>(StringComparer.Ordinal);
+        JsonDocument? document = null;
+        var jsonAttempted = false;
+        try
         {
-            if (current.ValueKind == JsonValueKind.Object && current.TryGetProperty(part, out var next))
+            foreach (var expression in expressions)
             {
-                current = next;
-            }
-            else
-            {
-                return null;
+                try
+                {
+                    if (expression.Type == "regex" && expression.Pattern is not null)
+                    {
+                        foreach (Match match in RuleRegex.Get(expression).Matches(line))
+                            AddIp(match.Groups["ip"].Value);
+                    }
+                    else if (expression.Type == "json" && expression.JsonPath is not null)
+                    {
+                        if (!jsonAttempted)
+                        {
+                            jsonAttempted = true;
+                            document = JsonDocument.Parse(line);
+                        }
+                        if (document is null)
+                            continue;
+                        var value = Navigate(document.RootElement, expression.JsonPath);
+                        if (value is null)
+                            continue;
+                        if (expression.JsonValue is not null)
+                        {
+                            if (!string.Equals(Scalar(value.Value), expression.JsonValue, StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            // A condition field (e.g. status=401) is not itself an IP address.
+                            value = Navigate(document.RootElement, expression.IpJsonPath ?? "ip");
+                        }
+                        if (value is not null)
+                            AddIp(Scalar(value.Value));
+                    }
+                }
+                catch (RegexMatchTimeoutException)
+                {
+                    logger.LogWarning("Regex timed out; pattern {Pattern}", expression.Pattern);
+                }
+                catch (ArgumentException ex)
+                {
+                    logger.LogWarning(ex, "Invalid rule expression");
+                }
+                catch (JsonException)
+                {
+                    // A non-JSON log line is a normal non-match.
+                }
             }
         }
+        finally { document?.Dispose(); }
+        return ips;
 
+        void AddIp(string? value)
+        {
+            if (IpAddressUtilities.Normalize(value) is { } ip)
+                ips.Add(ip);
+        }
+    }
+
+    private static string? Scalar(JsonElement value) => value.ValueKind switch
+    {
+        JsonValueKind.String => value.GetString(),
+        JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False => value.GetRawText(),
+        _ => null,
+    };
+
+    private static JsonElement? Navigate(JsonElement current, string path)
+    {
+        foreach (var part in path.Split('.'))
+        {
+            if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(part, out var next))
+                return null;
+            current = next;
+        }
         return current;
     }
 
-    private (string ip, int? durationSeconds, string reason)? ProcessIpMatch(
-        string ip,
-        BanRule rule,
-        RuleState state)
+    private static void Prune(Queue<DateTimeOffset> matches, DateTimeOffset cutoff)
     {
-        if (rule.Action.Type == "immediate")
-        {
-            // Immediate ban
-            return (ip, rule.Action.BanDurationSeconds, rule.Action.Reason);
-        }
-        else if (rule.Action.Type == "threshold")
-        {
-            // Threshold-based ban
-            var windowStart = DateTimeOffset.UtcNow.AddSeconds(-rule.Action.WindowSeconds);
-
-            // Clean old entries
-            if (!state.IpMatches.TryGetValue(ip, out var matches))
-            {
-                matches = new List<DateTimeOffset>();
-                state.IpMatches[ip] = matches;
-            }
-
-            matches.RemoveAll(m => m < windowStart);
-            matches.Add(DateTimeOffset.UtcNow);
-
-            _logger.LogDebug("IP {IP} matches count in {WindowSec}s window: {Count}/{Max}",
-                ip, rule.Action.WindowSeconds, matches.Count, rule.Action.MaxMatches);
-
-            if (matches.Count >= rule.Action.MaxMatches)
-            {
-                // Clear the state for this IP
-                state.IpMatches.Remove(ip);
-                return (ip, rule.Action.BanDurationSeconds, rule.Action.Reason);
-            }
-        }
-
-        return null;
+        while (matches.TryPeek(out var timestamp) && timestamp <= cutoff)
+            matches.Dequeue();
     }
 
     private sealed class RuleState
     {
-        public Dictionary<string, List<DateTimeOffset>> IpMatches { get; } = new();
+        public object Gate { get; } = new();
+        public Dictionary<string, Queue<DateTimeOffset>> Matches { get; } = new(StringComparer.Ordinal);
+        public DateTimeOffset NextCleanup;
+        public bool CapacityWarningLogged;
     }
 }

@@ -7,8 +7,8 @@ High-performance security plugin for [frps](https://github.com/fatedier/frp) tha
 - ✅ **Frp Plugin Integration** — Intercepts banned IPs at frps Login/NewUserConn stage
 - ✅ **TLS Encrypted Communication** — Binary protocol + TLS 1.2/1.3 between server and clients
 - ✅ **Rule Engine** — Client monitors log files and triggers bans automatically based on regex patterns
-- ✅ **High Performance** — Lock-free ConcurrentDictionary, ArrayPool buffering, FileSystemWatcher event-driven
-- ✅ **Production Hardened** — Connection pooling, rate limiting, buffer overflow protection
+- ✅ **High Performance** — ConcurrentDictionary lookup, pooled bounded frames, cached regexes, event-driven log tailing
+- ✅ **Production Hardened** — Bounded connections and queues, per-IP connection/message limits, handshake deadlines
 
 ---
 
@@ -29,7 +29,7 @@ High-performance security plugin for [frps](https://github.com/fatedier/frp) tha
  │  ▼                            │       │                                   │
  │  TLS client ──────────────────┼──────►│ TCP server (:9443)               │
  │    auto-reconnect             │       │   ├─ TLS 1.2/1.3 only            │
- │    health check (ping/pong)   │       │   ├─ Rate limiting (10 req/min)  │
+ │    health check (ping/pong)   │       │   ├─ Connection + message limits  │
  │    exponential backoff        │       │   └─ Connection pool (max 100)   │
  └──────────────────────────────┘       └──────────────────────────────────┘
 ```
@@ -47,12 +47,17 @@ High-performance security plugin for [frps](https://github.com/fatedier/frp) tha
 ```
 src/
 ├── FrpBan.Protocol/          # Shared binary protocol library
-│   ├── Message.cs            # Message serialization (max 64KB)
+│   ├── Message.cs            # Bounded message framing (max 64 KiB body)
+│   ├── Messages/             # Individual wire message types
+│   ├── Transport/            # Exact asynchronous frame reads
+│   ├── Security/             # Shared TLS trust validation
 │   └── MessageType.cs        # Protocol message types
 ├── FrpBan/                   # Server application
 │   ├── Services/
 │   │   ├── BanService.cs     # ConcurrentDictionary-based ban storage
 │   │   └── TcpServerService.cs  # TLS server + rate limiting
+│   ├── Endpoints/            # HTTP mapping and pre-body authorization
+│   ├── Security/             # Cached callback networks and bounded rate limits
 │   ├── Handlers/
 │   │   └── PluginRequestHandler.cs  # frps plugin handler
 │   └── Configuration/
@@ -60,10 +65,15 @@ src/
 └── FrpBan.Client/            # Client application
     ├── Services/
     │   ├── ClientConnectionService.cs  # Auto-reconnect TLS client
-    │   ├── LogMonitor.cs      # FileSystemWatcher-based log monitoring
+    │   ├── BanDeliveryService.cs # Bounded retry queue for disconnected clients
+    │   ├── FileLogMonitor.cs  # Serialized, bounded UTF-8 log tailing
     │   ├── RuleMatchEngine.cs # Regex pattern matching engine
     │   └── RulesLoader.cs     # YAML rule configuration loader
     └── rules.d/               # Ban rule definitions (YAML)
+
+tests/FrpBan.Tests/            # Unit, security and loopback integration tests
+Directory.Build.props         # Shared build properties
+Directory.Packages.props      # Central NuGet package versions
 ```
 
 ---
@@ -72,13 +82,13 @@ src/
 
 ### ✅ Implemented Protections
 
-- **TLS rate limiting**: 10 requests/minute per IP
-- **Connection pooling**: Max 100 concurrent TLS connections
-- **Buffer overflow protection**: 1MB max buffer per connection, 64KB max message size
+- **TLS rate limiting**: 10 new connections and 120 protocol messages/minute per IP (configurable)
+- **Connection pooling**: Max 100 concurrent TLS connections (configurable)
+- **Bounded input**: 64 KiB protocol/HTTP body limit, 64 Ki-character log-line limit
 - **TLS 1.2/1.3 only**: Disabled outdated protocols
 - **CIDR validation**: Validated prefix lengths (0-32 for IPv4, 0-128 for IPv6)
 - **Production TLS enforcement**: Cannot disable certificate validation in production
-- **Atomic operations**: Race-condition-free flag management
+- **Atomic persistence**: One coalescing writer and same-directory atomic file replacement
 
 ---
 
@@ -100,8 +110,7 @@ src/
       "Port": 9443,
       "CertificatePath": "/etc/frp-ban/certs/server.pfx",
       "CertificatePassword": "your-cert-password",
-      "RequireClientCertificate": false,
-      "AllowSelfSignedCertificates": false
+      "RequireClientCertificate": false
     }
   },
   "Logging": {
@@ -110,7 +119,7 @@ src/
       "Microsoft.AspNetCore": "Warning"
     }
   },
-  "urls": "http://0.0.0.0:9000"
+  "urls": "http://127.0.0.1:9000"
 }
 ```
 
@@ -132,6 +141,16 @@ export PluginSettings__Token="$(openssl rand -base64 32)"
 export PluginSettings__Tls__CertificatePassword="$(cat /etc/frp-ban/certs/password.txt)"
 ```
 
+Startup rejects placeholder tokens and secrets shorter than 32 characters. HTTP
+callbacks bind to loopback by default; configure the listener and trusted callback
+addresses explicitly if frps runs on another host. Ban durations use `null` for
+the configured default and `0` for a permanent ban.
+
+TLS deadlines and limits are configured under `PluginSettings.Tls`:
+`MaxConcurrentConnections` (100), `MaxConnectionsPerMinute` (10),
+`MaxMessagesPerMinute` (120), `HandshakeTimeoutSeconds` (10),
+`IdleTimeoutSeconds` (90), and `WriteTimeoutSeconds` (10).
+
 ### Client (`src/FrpBan.Client/appsettings.json`)
 
 ```json
@@ -144,9 +163,9 @@ export PluginSettings__Tls__CertificatePassword="$(cat /etc/frp-ban/certs/passwo
     "Tls": {
       "ValidateServerCertificate": true,
       "AllowSelfSignedCertificates": false,
-      "ClientCertificatePath": "/etc/frp-ban/certs/client.pfx",
-      "ClientCertificatePassword": "your-cert-password",
-      "CaCertificatePath": "/etc/frp-ban/certs/ca.crt"
+      "ClientCertificatePath": null,
+      "ClientCertificatePassword": null,
+      "CaCertificatePath": null
     },
     "Reconnection": {
       "InitialDelayMs": 5000,
@@ -159,35 +178,39 @@ export PluginSettings__Tls__CertificatePassword="$(cat /etc/frp-ban/certs/passwo
 }
 ```
 
+Client certificates are optional unless the server requires mTLS. Configure
+`CaCertificatePath` for a private CA; otherwise system trust is used.
+`ConnectionTimeoutSeconds` defaults to 15, `RequestTimeoutSeconds` to 10, and
+`MaxPendingBans` to 1024. Queued bans retry after reconnection and remain in memory
+only; normal process shutdown drains tasks but does not persist this client queue.
+
 ### Ban Rules (`src/FrpBan.Client/rules.d/*.yaml`)
 
 Example: `01-ssh-bruteforce.yaml`
 ```yaml
-name: ssh-bruteforce
-enabled: true
-log_source:
-  type: file
-  path: /var/log/auth.log
-
-patterns:
-  - pattern: 'Failed password for .+ from (?<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-    regex: true
-    ip_group: ip
-
-threshold:
-  count: 5
-  window_seconds: 300
-
-action:
-  duration_seconds: 3600
-  reason: "SSH brute force attempt"
+rules:
+  - name: ssh-bruteforce
+    enabled: true
+    logSource:
+      type: file
+      path: /var/log/auth.log
+    matching:
+      - type: regex
+        pattern: 'Failed password.*from (?<ip>\d+\.\d+\.\d+\.\d+)'
+    action:
+      type: threshold
+      maxMatches: 5
+      windowSeconds: 300
+      banDurationSeconds: 3600
+      reason: SSH brute force attempt
+    maxTrackedIps: 10000
 ```
 
 **Rule options:**
 - `type: file` — Monitor file with FileSystemWatcher (efficient, no polling)
-- `type: journal` — systemd journal monitoring (not yet implemented)
-- `threshold` — Trigger ban after N matches in time window
-- `duration_seconds: 0` — Permanent ban
+- `type: journal` — Not implemented; rejected during rule loading
+- `action.type: threshold` — Trigger after `maxMatches` in `windowSeconds`
+- `banDurationSeconds: 0` — Permanent ban
 
 ---
 
@@ -230,9 +253,11 @@ dotnet run
 
 ```bash
 # Self-signed certificate for development
-openssl req -x509 -newkey rsa:4096 -keyout server-key.pem -out server-cert.pem -days 365 -nodes
+openssl req -x509 -newkey rsa:4096 -keyout server-key.pem -out server-cert.pem -days 365 -nodes \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 openssl pkcs12 -export -out server.pfx -inkey server-key.pem -in server-cert.pem
 
+# Set ClientSettings.Tls.CaCertificatePath to server-cert.pem for this local certificate.
 # For production, use Let's Encrypt or your organization's CA
 ```
 
@@ -242,27 +267,15 @@ openssl pkcs12 -export -out server.pfx -inkey server-key.pem -in server-cert.pem
 
 ### Server (systemd)
 
+Install the appropriate native package using the steps in
+[Release packaging and installation](docs/RELEASING.md). Packages install the
+service, runtime and configuration directories; configure the token and TLS
+certificate before starting the service.
+
 ```bash
-# 1. Build self-contained binary
-dotnet publish src/FrpBan -c Release -r linux-x64 --self-contained -o ./publish/linux-x64
-
-# 2. Upload to server and run installer
-sudo ./deploy/install.sh
-```
-
-The installer:
-- Creates `frp-ban` system user (no login shell)
-- Installs binary to `/opt/frp-ban/`
-- Creates `/var/lib/frp-ban/` (persistence) and `/var/log/frp-ban/` (logs)
-- Places env file at `/etc/frp-ban/env` (mode `0640`) for secrets
-- Installs and enables `frp-ban.service`
-
-**Configure token:**
-```bash
-sudo nano /etc/frp-ban/env
-# Set: PluginSettings__Token=your-random-token-here
-
-sudo systemctl restart frp-ban
+sudo nano /etc/frp-ban/appsettings.json
+# Configure Token and Tls.CertificatePath, or set secrets in /etc/frp-ban/env.
+sudo systemctl enable --now frp-ban
 sudo systemctl status frp-ban
 journalctl -u frp-ban -f
 ```
@@ -337,13 +350,18 @@ sudo grep -i error /var/log/frp-ban/frp-ban-*.log
 
 | Metric | Value |
 |--------|-------|
-| Ban lookup (IsBanned) | O(1) lock-free read |
+| Ban lookup (IsBanned) | ConcurrentDictionary lookup with canonical IP keys |
 | Max concurrent TLS connections | 100 (configurable) |
-| TLS rate limit | 10 req/min per IP |
-| Max message size | 64 KB |
-| Max buffer per connection | 1 MB |
-| File monitor latency | ~50ms (FileSystemWatcher) |
-| Memory: BanService | ~1KB per banned IP |
+| TLS connection rate | 10 new connections/minute per IP (configurable) |
+| Protocol message rate | 120 messages/minute per IP (configurable) |
+| Max protocol/HTTP body | 64 KiB |
+| Frame buffers | Pooled on demand; no fixed 1 MiB receive buffer |
+| File monitoring | Event-driven, serialized reads with bounded partial-line state |
+| Regex matching | Cached per expression, 100 ms timeout |
+| Persistence | One writer, approximately 100 ms burst coalescing, atomic replace |
+
+These describe implementation limits, not benchmark results. Production latency,
+throughput, and memory usage depend on workload and require measurement.
 
 ---
 
