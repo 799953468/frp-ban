@@ -22,6 +22,10 @@ RIDS = (
     "win-x64", "win-arm64", "osx-x64", "osx-arm64",
     "linux-x64", "linux-arm64", "linux-musl-x64", "linux-musl-arm64",
 )
+COMPONENTS = {
+    "server": {"name": "frp-ban", "assembly": "FrpBan", "project": "FrpBan"},
+    "client": {"name": "frp-ban-client", "assembly": "FrpBan.Client", "project": "FrpBan.Client"},
+}
 DEPENDENCIES = {
     "deb": ["libc6", "libgcc-s1", "libstdc++6", "zlib1g", "libicu-dev",
             "libssl3 | libssl3t64", "ca-certificates"],
@@ -49,8 +53,8 @@ def extensions(rid):
     return ("tar.gz", "deb", "rpm", "pkg.tar.zst")
 
 
-def asset_name(version, rid, extension):
-    return f"frp-ban-{version}-{rid}.{extension}"
+def asset_name(version, rid, extension, component="server"):
+    return f"{COMPONENTS[component]['name']}-{version}-{rid}.{extension}"
 
 
 def run(*args):
@@ -68,121 +72,148 @@ def write_json(path, value):
     write(path, json.dumps(value, indent=2) + "\n")
 
 
-def prepare_payload(published, target, rid):
+def prepare_payload(published, target, rid, component="server"):
     """Keep the entire self-contained publish output, including native libraries."""
-    executable = "FrpBan.exe" if rid.startswith("win-") else "FrpBan"
-    for required in (executable, "FrpBan.dll", "FrpBan.runtimeconfig.json",
-                     "System.Private.CoreLib.dll", "appsettings.json"):
+    assembly = COMPONENTS[component]["assembly"]
+    executable = assembly + (".exe" if rid.startswith("win-") else "")
+    required_files = [executable, f"{assembly}.dll", f"{assembly}.runtimeconfig.json",
+                      "System.Private.CoreLib.dll", "appsettings.json"]
+    if component == "client":
+        required_files.extend(path.relative_to(ROOT / "src/FrpBan.Client")
+                              for path in sorted((ROOT / "src/FrpBan.Client/rules.d").rglob("*.yaml")))
+    for required in required_files:
         if not (published / required).is_file():
             raise ValueError(f"Incomplete self-contained publish output: {published / required}")
     shutil.copytree(published, target)
-    # Development settings should never change an installed server's behavior.
+    # Development settings should never change an installed application's behavior.
     for path in target.glob("appsettings.*.json"):
         path.unlink()
-    for name in ("LICENSE", "frps.toml.example"):
+    for name in ("LICENSE", "frps.toml.example") if component == "server" else ("LICENSE",):
         shutil.copy2(ROOT / name, target / name)
     shutil.copy2(ROOT / "packaging/RELEASE_NOTES.md", target / "README.md")
     if not rid.startswith("win-"):
         (target / executable).chmod(0o755)
 
 
-def portable_config(payload):
+def portable_config(payload, component="server"):
     config = json.loads((payload / "appsettings.json").read_text())
-    settings = config["PluginSettings"]
-    settings["BanFilePath"] = "data/bans.json"
-    settings["AppLogPath"] = "logs/frp-ban-.log"
-    settings["Tls"]["CertificatePath"] = "certs/server.pfx"
+    if component == "server":
+        settings = config["PluginSettings"]
+        settings["BanFilePath"] = "data/bans.json"
+        settings["AppLogPath"] = "logs/frp-ban-.log"
+        settings["Tls"]["CertificatePath"] = "certs/server.pfx"
+    else:
+        settings = config["ClientSettings"]
+        settings["RulesPath"] = "rules.d"
+        settings["AppLogPath"] = "logs/frp-ban-client-.log"
     write_json(payload / "appsettings.json", config)
 
 
-def archive(payload, rid, version, destination):
-    name = asset_name(version, rid, "zip" if rid.startswith("win-") else "tar.gz")
+def archive(payload, rid, version, destination, component="server"):
+    app = COMPONENTS[component]
+    name = asset_name(version, rid, "zip" if rid.startswith("win-") else "tar.gz", component)
     prefix = name.removesuffix(".zip").removesuffix(".tar.gz")
     if rid.startswith("win-"):
-        write(payload / "frp-ban.cmd",
-              '@echo off\r\ncd /d "%~dp0"\r\n"%~dp0FrpBan.exe" %*\r\n')
+        write(payload / f"{app['name']}.cmd",
+              f'@echo off\r\ncd /d "%~dp0"\r\n"%~dp0{app["assembly"]}.exe" %*\r\n')
         with zipfile.ZipFile(destination / name, "w", zipfile.ZIP_DEFLATED) as output:
             for path in sorted(payload.rglob("*")):
                 if path.is_file():
                     output.write(path, f"{prefix}/{path.relative_to(payload).as_posix()}")
     else:
-        write(payload / "frp-ban", '#!/bin/sh\nset -eu\ncd "$(dirname "$0")"\nexec ./FrpBan "$@"\n', 0o755)
+        write(payload / app["name"],
+              f'#!/bin/sh\nset -eu\ncd "$(dirname "$0")"\nexec ./{app["assembly"]} "$@"\n', 0o755)
         with tarfile.open(destination / name, "w:gz") as output:
             output.add(payload, arcname=prefix)
 
 
-def linux_config(payload, rid, version, packager):
+def linux_config(payload, rid, version, packager, component="server"):
+    name = COMPONENTS[component]["name"]
+    templates = ROOT / "packaging/linux"
+    if component == "client":
+        templates /= "client"
     contents = []
     for path in sorted(payload.rglob("*")):
         if path.is_file() and path.name != "appsettings.json":
-            contents.append({"src": str(path),
-                             "dst": f"/opt/frp-ban/{path.relative_to(payload).as_posix()}"})
+            relative = path.relative_to(payload)
+            if component == "client" and relative.parts[0] == "rules.d":
+                contents.append({"src": str(path), "dst": f"/etc/{name}/{relative.as_posix()}",
+                                 "type": "config|noreplace",
+                                 "file_info": {"mode": 0o640, "group": name}})
+            else:
+                contents.append({"src": str(path), "dst": f"/opt/{name}/{relative.as_posix()}"})
     contents.extend([
-        {"src": str(payload / "appsettings.json"), "dst": "/etc/frp-ban/appsettings.json",
-         "type": "config|noreplace", "file_info": {"mode": 0o640, "group": "frp-ban"}},
-        {"src": str(ROOT / "packaging/linux/frp-ban"), "dst": "/usr/bin/frp-ban",
+        {"src": str(payload / "appsettings.json"), "dst": f"/etc/{name}/appsettings.json",
+         "type": "config|noreplace", "file_info": {"mode": 0o640, "group": name}},
+        {"src": str(templates / name), "dst": f"/usr/bin/{name}",
          "file_info": {"mode": 0o755}},
     ])
     if packager == "apk":
-        contents.append({"src": str(ROOT / "packaging/linux/frp-ban.openrc"),
-                         "dst": "/etc/init.d/frp-ban", "file_info": {"mode": 0o755}})
+        contents.append({"src": str(templates / f"{name}.openrc"),
+                         "dst": f"/etc/init.d/{name}", "file_info": {"mode": 0o755}})
     else:
-        contents.append({"src": str(ROOT / "packaging/linux/frp-ban.service"),
-                         "dst": "/usr/lib/systemd/system/frp-ban.service"})
+        contents.append({"src": str(templates / f"{name}.service"),
+                         "dst": f"/usr/lib/systemd/system/{name}.service"})
     config = {
-        "name": "frp-ban", "arch": "arm64" if rid.endswith("arm64") else "amd64",
+        "name": name, "arch": "arm64" if rid.endswith("arm64") else "amd64",
         "platform": "linux", "version": version, "release": "1",
         "maintainer": "FRP Ban Maintainers <799953468@users.noreply.github.com>",
-        "description": "TLS-encrypted IP banning server for FRP",
+        "description": f"TLS-encrypted IP banning {component} for FRP",
         "homepage": "https://github.com/799953468/frp-ban", "license": "MIT",
         "depends": DEPENDENCIES[packager], "contents": contents,
-        "scripts": {name: str(ROOT / f"packaging/linux/{name}.sh") for name in
+        "scripts": {name: str(templates / f"{name}.sh") for name in
                     ("preinstall", "postinstall", "preremove", "postremove")},
     }
     if packager == "deb":
         config["depends"] = [*config["depends"], "passwd"]
     if packager == "archlinux":
         config["archlinux"] = {"scripts": {
-            "preupgrade": str(ROOT / "packaging/linux/preinstall.sh"),
-            "postupgrade": str(ROOT / "packaging/linux/postinstall.sh"),
+            "preupgrade": str(templates / "preinstall.sh"),
+            "postupgrade": str(templates / "postinstall.sh"),
         }}
     if packager == "apk":
         config["apk"] = {"scripts": {
-            "preupgrade": str(ROOT / "packaging/linux/preinstall.sh"),
-            "postupgrade": str(ROOT / "packaging/linux/postinstall.sh"),
+            "preupgrade": str(templates / "preinstall.sh"),
+            "postupgrade": str(templates / "postinstall.sh"),
         }}
     return config
 
 
-def linux_packages(payload, rid, version, work, destination):
+def linux_packages(payload, rid, version, work, destination, component="server"):
     # Restore system paths after producing the portable archive.
-    shutil.copy2(ROOT / "src/FrpBan/appsettings.json", payload / "appsettings.json")
-    (payload / "frp-ban").unlink()
+    app = COMPONENTS[component]
+    shutil.copy2(ROOT / "src" / app["project"] / "appsettings.json", payload / "appsettings.json")
+    if component == "client":
+        config = json.loads((payload / "appsettings.json").read_text())
+        config["ClientSettings"]["AppLogPath"] = "/var/log/frp-ban-client/frp-ban-client-.log"
+        write_json(payload / "appsettings.json", config)
+    (payload / app["name"]).unlink()
     formats = ("apk",) if "musl" in rid else ("deb", "rpm", "archlinux")
     for packager in formats:
         config_path = work / f"nfpm-{packager}.json"
-        write_json(config_path, linux_config(payload, rid, version, packager))
+        write_json(config_path, linux_config(payload, rid, version, packager, component))
         extension = "pkg.tar.zst" if packager == "archlinux" else packager
         run("nfpm", "package", "--config", config_path, "--packager", packager,
-            "--target", destination / asset_name(version, rid, extension))
+            "--target", destination / asset_name(version, rid, extension, component))
 
 
-def package(rid, version, published, destination):
-    work = ROOT / "publish/packages" / rid
+def package(rid, version, published, destination, component="server"):
+    work = ROOT / "publish/packages" / component / rid
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
     destination.mkdir(parents=True, exist_ok=True)
     payload = work / "payload"
-    prepare_payload(published, payload, rid)
-    portable_config(payload)
-    archive(payload, rid, version, destination)
+    prepare_payload(published, payload, rid, component)
+    portable_config(payload, component)
+    archive(payload, rid, version, destination, component)
     if rid.startswith("linux-"):
-        linux_packages(payload, rid, version, work, destination)
+        linux_packages(payload, rid, version, work, destination, component)
 
 
 def checksums(version, destination):
-    expected = {asset_name(version, rid, ext) for rid in RIDS for ext in extensions(rid)}
+    expected = {asset_name(version, rid, ext, component)
+                for component in COMPONENTS for rid in RIDS for ext in extensions(rid)}
     actual = {path.name for path in destination.iterdir() if path.name != "SHA256SUMS"}
     if actual != expected:
         raise ValueError(f"Asset set mismatch. Missing: {sorted(expected - actual)}; "
@@ -258,6 +289,7 @@ def main():
         child = commands.add_parser(command)
         if command in ("build", "package"):
             child.add_argument("rid", choices=RIDS)
+            child.add_argument("--component", choices=COMPONENTS, default="server")
         child.add_argument("tag")
         child.add_argument("--output", type=Path, default=ROOT / "dist")
         if command == "package":
@@ -268,16 +300,18 @@ def main():
     if args.command == "validate":
         print(version)
     elif args.command in ("build", "package"):
+        app = COMPONENTS[args.component]
         if args.command == "build":
-            published = ROOT / "publish/binaries" / args.rid
+            published = ROOT / "publish/binaries" / args.component / args.rid
             if published.exists():
                 shutil.rmtree(published)
-            run("dotnet", "publish", ROOT / "src/FrpBan/FrpBan.csproj", "-c", "Release",
+            project = ROOT / "src" / app["project"] / f"{app['project']}.csproj"
+            run("dotnet", "publish", project, "-c", "Release",
                 "-r", args.rid, "--self-contained", "true", "-p:PublishSingleFile=false",
                 "-p:PublishTrimmed=false", f"-p:Version={version}", "-o", published)
         else:
             published = args.publish_dir.resolve()
-        package(args.rid, version, published, destination)
+        package(args.rid, version, published, destination, args.component)
     elif args.command == "checksums":
         checksums(version, destination)
     else:

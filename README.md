@@ -220,7 +220,8 @@ rules:
 
 Tagged releases provide Windows `.zip`, macOS `.tar.gz`, and Linux
 `.deb`, `.rpm`, Arch `.pkg.tar.zst`, Alpine `.apk` and portable `.tar.gz` builds for
-x64 and ARM64. These packages contain the server and its .NET runtime.
+x64 and ARM64. Server (`frp-ban-…`) and client (`frp-ban-client-…`) are packaged
+separately, each with its .NET runtime. Client packages also include YAML rules.
 See [Release packaging and installation](docs/RELEASING.md) for the full matrix,
 configuration steps and GitHub/GitLab CI runner requirements.
 
@@ -282,30 +283,21 @@ journalctl -u frp-ban -f
 
 ### Client (systemd)
 
-Create `/etc/systemd/system/frp-ban-client.service`:
-```ini
-[Unit]
-Description=FrpBan Client - Automated IP Ban Monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=frp-ban
-WorkingDirectory=/opt/frp-ban-client
-ExecStart=/opt/frp-ban-client/FrpBan.Client
-Restart=always
-RestartSec=10
-EnvironmentFile=/etc/frp-ban/client.env
-
-[Install]
-WantedBy=multi-user.target
-```
+Install the client native package using the steps in
+[Release packaging and installation](docs/RELEASING.md). Configure the server
+address, token and TLS trust, edit the bundled rules, and grant the
+`frp-ban-client` account read access to monitored logs before starting the service.
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable frp-ban-client
-sudo systemctl start frp-ban-client
+# Arch Linux example (use linux-arm64 on Arch Linux ARM)
+sudo pacman -U ./frp-ban-client-1.2.3-linux-x64.pkg.tar.zst
+sudo nano /etc/frp-ban-client/appsettings.json
+sudo nano /etc/frp-ban-client/rules.d/01-ssh-bruteforce.yaml
+# If monitored logs are owned by adm, grant access before starting:
+# sudo usermod -aG adm frp-ban-client
+sudo systemctl enable --now frp-ban-client
+sudo systemctl status frp-ban-client
+journalctl -u frp-ban-client -f
 ```
 
 ---

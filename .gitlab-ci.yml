@@ -38,12 +38,13 @@ build:
   needs: [test]
   parallel:
     matrix:
-      - RID: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
+      - COMPONENT: [server, client]
+        RID: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
   script:
     - case "$RID" in linux-*) bash scripts/install-nfpm.sh ;; esac
-    - python3 scripts/release.py build "$RID" "$CI_COMMIT_TAG"
+    - python3 scripts/release.py build "$RID" "$CI_COMMIT_TAG" --component "$COMPONENT"
   artifacts:
-    name: frp-ban-$CI_COMMIT_TAG-$RID
+    name: frp-ban-$CI_COMMIT_TAG-$COMPONENT-$RID
     paths: [dist/]
     expire_in: 7 days
 

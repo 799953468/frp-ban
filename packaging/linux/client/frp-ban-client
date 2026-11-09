@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+cd /etc/frp-ban-client
+exec /opt/frp-ban-client/FrpBan.Client "$@"

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-09
+
+### Added
+
+- Publish separate self-contained client packages alongside server packages on GitHub and GitLab.
+- Provide both components for eight runtime identifiers on Windows, macOS and Linux (x64/ARM64).
+- Include client configuration, YAML rules, portable launchers, Linux service accounts and systemd/OpenRC services.
+- Provide Arch Linux and Arch Linux ARM `.pkg.tar.zst` packages for both components.
+- Verify the complete set of 32 assets and publish SHA-256 checksums for every package.
+- Preserve client configuration and bundled rules on native package upgrades; document installation and log permissions.
+- Expand release regression coverage to validate the client payload, component isolation and full packaging matrix.
+
 ### Security
 
 - Validate complete bounded protocol frames and strict required JSON fields.
@@ -91,5 +103,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auto-reconnect TLS client with exponential backoff
 - Health check (ping/pong) protocol
 
-[2.0.0]: https://github.com/your-repo/frp-ban/compare/v1.0.0...v2.0.0
-[1.0.0]: https://github.com/your-repo/frp-ban/releases/tag/v1.0.0
+[Unreleased]: https://github.com/799953468/frp-ban/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/799953468/frp-ban/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/799953468/frp-ban/releases/tag/v1.0.0

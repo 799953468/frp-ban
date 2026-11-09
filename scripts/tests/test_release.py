@@ -2,6 +2,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,22 +22,27 @@ class ReleaseTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.work = Path(self.directory.name)
 
-    def published(self, rid):
-        source = self.work / rid
-        source.mkdir()
-        exe = "FrpBan.exe" if rid.startswith("win-") else "FrpBan"
-        for name in (exe, "FrpBan.dll", "FrpBan.runtimeconfig.json",
+    def published(self, rid, component="server"):
+        source = self.work / component / rid
+        source.mkdir(parents=True)
+        app = release.COMPONENTS[component]
+        assembly = app["assembly"]
+        exe = assembly + (".exe" if rid.startswith("win-") else "")
+        for name in (exe, f"{assembly}.dll", f"{assembly}.runtimeconfig.json",
                      "System.Private.CoreLib.dll", "libcoreclr.so", "dependency.dll"):
             (source / name).write_bytes(b"test payload")
         (source / "appsettings.json").write_bytes(
-            (release.ROOT / "src/FrpBan/appsettings.json").read_bytes())
+            (release.ROOT / "src" / app["project"] / "appsettings.json").read_bytes())
+        if component == "client":
+            shutil.copytree(release.ROOT / "src/FrpBan.Client/rules.d", source / "rules.d")
         (source / "appsettings.Development.json").write_text("{}")
         return source
 
     def all_assets(self):
-        for rid in release.RIDS:
-            for ext in release.extensions(rid):
-                (self.work / release.asset_name("1.2.3", rid, ext)).write_bytes(b"asset")
+        for component in release.COMPONENTS:
+            for rid in release.RIDS:
+                for ext in release.extensions(rid):
+                    (self.work / release.asset_name("1.2.3", rid, ext, component)).write_bytes(b"asset")
 
     def test_only_stable_version_tags_are_accepted(self):
         self.assertEqual("1.2.3", release.version_from_tag("v1.2.3"))
@@ -113,18 +120,18 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual({"frp-ban-1.2.3-win-x64.zip", "frp-ban-1.2.3-osx-arm64.tar.gz"},
                          {path.name for path in destination.iterdir()})
 
-    def test_checksums_cover_all_sixteen_assets(self):
+    def test_checksums_cover_all_thirty_two_server_and_client_assets(self):
         self.all_assets()
         release.checksums("1.2.3", self.work)
         lines = (self.work / "SHA256SUMS").read_text().splitlines()
-        self.assertEqual(16, len(lines))
+        self.assertEqual(32, len(lines))
         digest = hashlib.sha256(b"asset").hexdigest()
         self.assertTrue(all(line.startswith(digest + "  ") for line in lines))
         release.checksums("1.2.3", self.work)  # Safe when a job is retried.
 
     def test_missing_or_empty_assets_block_publication(self):
         self.all_assets()
-        asset = self.work / "frp-ban-1.2.3-osx-arm64.tar.gz"
+        asset = self.work / "frp-ban-client-1.2.3-osx-arm64.tar.gz"
         asset.write_bytes(b"")
         with self.assertRaisesRegex(ValueError, "Empty or invalid"):
             release.checksums("1.2.3", self.work)
@@ -163,11 +170,141 @@ class ReleaseTests(unittest.TestCase):
         with patch.dict(release.os.environ, env), patch.object(release, "urlopen", transport):
             release.gitlab_release("v1.2.3", "1.2.3", self.work)
         uploads = [call for call in calls if "/packages/generic/" in call[1]]
-        self.assertEqual(17, len(uploads))
+        self.assertEqual(33, len(uploads))
         self.assertTrue(all(method == "PUT" and body for method, _, body in uploads))
         self.assertTrue(any(url.endswith("/assets/links/42") and method == "PUT"
                             for method, url, _ in calls))
         self.assertTrue(all("test-only-token" not in url for _, url, _ in calls))
+
+    def test_client_archives_include_runtime_rules_config_and_correct_launcher(self):
+        for rid in release.RIDS:
+            with self.subTest(rid=rid):
+                source = self.published(rid, "client")
+                payload = self.work / f"payload-{rid}"
+                release.prepare_payload(source, payload, rid, "client")
+                release.portable_config(payload, "client")
+                release.archive(payload, rid, "1.2.3", self.work, "client")
+                prefix = f"frp-ban-client-1.2.3-{rid}/"
+                extension = "zip" if rid.startswith("win-") else "tar.gz"
+                path = self.work / release.asset_name("1.2.3", rid, extension, "client")
+                if extension == "zip":
+                    with zipfile.ZipFile(path) as bundle:
+                        files = {name[len(prefix):]: bundle.read(name) for name in bundle.namelist()}
+                    self.assertIn(b'"%~dp0FrpBan.Client.exe" %*', files["frp-ban-client.cmd"])
+                    self.assertIn("FrpBan.Client.exe", files)
+                else:
+                    with tarfile.open(path) as bundle:
+                        files = {item.name[len(prefix):]: bundle.extractfile(item).read()
+                                 for item in bundle.getmembers() if item.isfile()}
+                        for name in ("FrpBan.Client", "frp-ban-client"):
+                            self.assertTrue(bundle.getmember(prefix + name).mode & 0o111)
+                    self.assertIn(b'exec ./FrpBan.Client "$@"', files["frp-ban-client"])
+                for name in ("FrpBan.Client.dll", "FrpBan.Client.runtimeconfig.json",
+                             "System.Private.CoreLib.dll", "dependency.dll", "LICENSE", "README.md",
+                             "rules.d/01-ssh-bruteforce.yaml", "rules.d/02-ssh-invalid-user.yaml"):
+                    self.assertIn(name, files)
+                self.assertNotIn("frps.toml.example", files)
+                self.assertNotIn("appsettings.Development.json", files)
+                settings = json.loads(files["appsettings.json"])["ClientSettings"]
+                self.assertEqual("rules.d", settings["RulesPath"])
+                self.assertEqual("logs/frp-ban-client-.log", settings["AppLogPath"])
+                self.assertTrue(settings["Tls"]["ValidateServerCertificate"])
+
+    def test_client_missing_rules_or_runtime_block_packaging(self):
+        for filename in ("rules.d/01-ssh-bruteforce.yaml", "System.Private.CoreLib.dll",
+                         "FrpBan.Client.dll", "FrpBan.Client.runtimeconfig.json", "FrpBan.Client"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "published"
+                original = self.published("linux-x64", "client")
+                shutil.move(original, source)
+                (source / filename).unlink()
+                with self.assertRaisesRegex(ValueError, "Incomplete self-contained"):
+                    release.prepare_payload(source, Path(directory) / "payload", "linux-x64", "client")
+
+    def test_native_client_packages_keep_rules_and_config_separate_from_server(self):
+        source = self.published("linux-arm64", "client")
+        payload = self.work / "payload"
+        release.prepare_payload(source, payload, "linux-arm64", "client")
+        for packager in ("deb", "rpm", "archlinux", "apk"):
+            with self.subTest(packager=packager):
+                config = release.linux_config(payload, "linux-arm64", "1.2.3", packager, "client")
+                self.assertEqual("frp-ban-client", config["name"])
+                self.assertEqual("arm64", config["arch"])
+                files = {item["dst"]: item for item in config["contents"]}
+                self.assertIn("/opt/frp-ban-client/FrpBan.Client", files)
+                self.assertIn("/opt/frp-ban-client/System.Private.CoreLib.dll", files)
+                self.assertNotIn("/opt/frp-ban-client/appsettings.json", files)
+                for relative in ("appsettings.json", "rules.d/01-ssh-bruteforce.yaml",
+                                 "rules.d/02-ssh-invalid-user.yaml"):
+                    item = files[f"/etc/frp-ban-client/{relative}"]
+                    self.assertEqual("config|noreplace", item["type"])
+                    self.assertEqual({"mode": 0o640, "group": "frp-ban-client"}, item["file_info"])
+                self.assertIn("/etc/init.d/frp-ban-client" if packager == "apk" else
+                              "/usr/lib/systemd/system/frp-ban-client.service", files)
+                self.assertIn("/usr/bin/frp-ban-client", files)
+                self.assertTrue(all("/frp-ban/" not in path for path in files))
+                for item in files.values():
+                    self.assertTrue(Path(item["src"]).is_file(), item)
+                for script in config["scripts"].values():
+                    self.assertTrue(Path(script).is_file())
+                if packager in ("archlinux", "apk"):
+                    for script in config[packager]["scripts"].values():
+                        self.assertTrue(Path(script).is_file())
+                        self.assertIn("/client/", script)
+
+    def test_build_selects_component_project_and_isolates_publish_directories(self):
+        for component, app in release.COMPONENTS.items():
+            with self.subTest(component=component), \
+                    patch.object(release.sys, "argv", ["release.py", "build", "linux-x64", "v1.2.3",
+                                                      "--component", component]), \
+                    patch.object(release, "ROOT", self.work), \
+                    patch.object(release, "run") as run, \
+                    patch.object(release, "package") as package:
+                release.main()
+                published = self.work / "publish/binaries" / component / "linux-x64"
+                command = run.call_args.args
+                self.assertEqual(self.work / "src" / app["project"] / f"{app['project']}.csproj", command[2])
+                self.assertIn("--self-contained", command)
+                self.assertIn("-p:Version=1.2.3", command)
+                self.assertEqual(published, command[-1])
+                package.assert_called_once_with("linux-x64", "1.2.3", published,
+                                                (self.work / "dist").resolve(), component)
+
+    def test_full_package_matrix_includes_arch_linux_for_both_components(self):
+        sources = {(component, rid): self.published(rid, component)
+                   for component in release.COMPONENTS for rid in release.RIDS}
+        root = self.work / "root"
+        for name in ("LICENSE", "frps.toml.example"):
+            release.write(root / name, (release.ROOT / name).read_text())
+        shutil.copytree(release.ROOT / "packaging", root / "packaging")
+        for app in release.COMPONENTS.values():
+            shutil.copytree(release.ROOT / "src" / app["project"], root / "src" / app["project"],
+                            ignore=shutil.ignore_patterns("bin", "obj"))
+        destination = self.work / "dist"
+        configs = []
+
+        def nfpm(*args):
+            self.assertEqual(("nfpm", "package", "--config"), args[:3])
+            config = json.loads(Path(args[3]).read_text())
+            settings = next(item for item in config["contents"] if item["dst"].endswith("/appsettings.json"))
+            settings = json.loads(Path(settings["src"]).read_text())
+            if config["name"] == "frp-ban-client":
+                self.assertEqual("/var/log/frp-ban-client/frp-ban-client-.log",
+                                 settings["ClientSettings"]["AppLogPath"])
+                self.assertEqual("rules.d", settings["ClientSettings"]["RulesPath"])
+            configs.append((args[5], config))
+            Path(args[-1]).write_bytes(b"native package")
+
+        with patch.object(release, "ROOT", root), patch.object(release, "run", nfpm):
+            for (component, rid), source in sources.items():
+                release.package(rid, "1.2.3", source, destination, component)
+            release.checksums("1.2.3", destination)
+        self.assertEqual(33, len(list(destination.iterdir())))
+        self.assertEqual(16, len(configs))
+        self.assertEqual(4, sum(packager == "archlinux" for packager, _ in configs))
+        for component in release.COMPONENTS:
+            for rid in ("linux-x64", "linux-arm64"):
+                self.assertTrue((destination / release.asset_name("1.2.3", rid, "pkg.tar.zst", component)).is_file())
 
 
 if __name__ == "__main__":
