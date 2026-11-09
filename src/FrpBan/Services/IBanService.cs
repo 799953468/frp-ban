@@ -24,3 +24,4 @@ public interface IBanService
     /// <summary>Returns a snapshot of all currently active bans.</summary>
     IReadOnlyList<BanEntry> GetActiveBans();
 }
+

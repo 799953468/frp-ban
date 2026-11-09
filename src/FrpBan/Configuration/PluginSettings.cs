@@ -41,4 +41,62 @@ public sealed class PluginSettings
     /// Default ban duration in seconds. 0 means permanent.
     /// </summary>
     public int DefaultBanDurationSeconds { get; init; } = 3600;
+
+    /// <summary>
+    /// TLS/HTTPS configuration settings for client-server communication.
+    /// </summary>
+    public TlsSettings? Tls { get; init; }
 }
+
+/// <summary>
+/// TLS/HTTPS configuration for secure client-server communication.
+/// </summary>
+public sealed class TlsSettings
+{
+    /// <summary>
+    /// Enable TLS for client-server communication.
+    /// </summary>
+    public bool Enabled { get; init; }
+
+    /// <summary>
+    /// Enable TCP listener for client connections (binary protocol).
+    /// </summary>
+    public bool TcpListenerEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Port for TCP listener with TLS (e.g., 9443).
+    /// </summary>
+    public int Port { get; init; } = 9443;
+
+    /// <summary>
+    /// Path to the server TLS certificate file (.pfx or .pem).
+    /// </summary>
+    public string? CertificatePath { get; init; }
+
+    /// <summary>
+    /// Password for the certificate file (if using .pfx).
+    /// </summary>
+    public string? CertificatePassword { get; init; }
+
+    /// <summary>
+    /// Path to the private key file (if using .pem certificate).
+    /// </summary>
+    public string? KeyPath { get; init; }
+
+    /// <summary>
+    /// Allow self-signed certificates. Useful for development/testing.
+    /// WARNING: Do not use in production with untrusted sources.
+    /// </summary>
+    public bool AllowSelfSignedCertificates { get; init; }
+
+    /// <summary>
+    /// Require client certificates for mutual TLS (mTLS).
+    /// </summary>
+    public bool RequireClientCertificate { get; init; }
+
+    /// <summary>
+    /// Path to the CA certificate for validating client certificates (mTLS).
+    /// </summary>
+    public string? ClientCertificateAuthority { get; init; }
+}
+

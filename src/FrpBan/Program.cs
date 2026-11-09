@@ -64,6 +64,7 @@ builder.Services.AddSingleton<IBanService>(sp => sp.GetRequiredService<BanServic
 builder.Services.AddSingleton<AccessLogService>();
 builder.Services.AddSingleton<IAccessLogService>(sp => sp.GetRequiredService<AccessLogService>());
 builder.Services.AddSingleton<PluginRequestHandler>();
+builder.Services.AddHostedService<TcpServerService>();
 
 var app = builder.Build();
 
