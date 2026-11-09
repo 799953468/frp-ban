@@ -30,21 +30,18 @@ jobs:
     strategy:
       matrix:
         include:
-          # Windows
           - os: windows-latest
             rid: win-x64
             artifact: frp-ban-windows-x64.zip
           - os: windows-latest
             rid: win-arm64
             artifact: frp-ban-windows-arm64.zip
-          # macOS
           - os: macos-latest
             rid: osx-x64
             artifact: frp-ban-macos-x64.tar.gz
           - os: macos-latest
             rid: osx-arm64
             artifact: frp-ban-macos-arm64.tar.gz
-          # Linux
           - os: ubuntu-latest
             rid: linux-x64
             artifact: frp-ban-linux-x64.tar.gz
@@ -54,7 +51,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Setup .NET 11 (preview)
+      - name: Setup .NET 11 (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile dotnet-install.ps1
+          & .\dotnet-install.ps1 -Channel 11.0 -Quality preview
+          echo "$HOME\.dotnet" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "DOTNET_NOLOGO=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Setup .NET 11 (Unix)
+        if: runner.os != 'Windows'
         run: |
           curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
           echo "$HOME/.dotnet" >> "$GITHUB_PATH"
@@ -64,12 +71,12 @@ jobs:
         run: dotnet restore FrpBan.slnx
       - name: Publish (${{ matrix.rid }})
         run: |
-          dotnet publish src/FrpBan \
-            -c Release \
-            -r ${{ matrix.rid }} \
-            --self-contained true \
-            -p:PublishSingleFile=true \
-            -p:PublishTrimmed=false \
+          dotnet publish src/FrpBan `
+            -c Release `
+            -r ${{ matrix.rid }} `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:PublishTrimmed=false `
             -o ./publish/${{ matrix.rid }}
       - name: Archive (Windows)
         if: runner.os == 'Windows'
@@ -108,7 +115,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Setup .NET 11 (preview)
+      - name: Setup .NET 11
         run: |
           curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
           echo "$HOME/.dotnet" >> "$GITHUB_PATH"
