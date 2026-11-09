@@ -7,8 +7,46 @@ using FrpBan.Models;
 using FrpBan.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
+using Serilog;
+using Serilog.Events;
+
+// -------------------------------------------------------------------------
+// Configuration Loading
+// -------------------------------------------------------------------------
+var config = new ConfigurationBuilder()
+    .SetBasePath(Directory.GetCurrentDirectory())
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production"}.json", optional: true)
+    .AddEnvironmentVariables()
+    .Build();
+
+// Load PluginSettings to get log path
+var pluginSettings = config.GetSection("PluginSettings").Get<PluginSettings>() ?? new PluginSettings();
+
+// -------------------------------------------------------------------------
+// Serilog Configuration
+// -------------------------------------------------------------------------
+Log.Logger = new LoggerConfiguration()
+    .ReadFrom.Configuration(config)
+    .WriteTo.Async(a => a.File(
+        path: pluginSettings.AppLogPath,
+        rollingInterval: RollingInterval.Day,
+        rollOnFileSizeLimit: true,
+        fileSizeLimitBytes: 104857600,
+        retainedFileCountLimit: 30,
+        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}",
+        restrictedToMinimumLevel: LogEventLevel.Information
+    ), bufferSize: 10000, blockWhenFull: false)
+    .CreateLogger();
+
+try
+{
+    Log.Information("Starting frp-ban server");
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Use Serilog for all logging
+builder.Host.UseSerilog();
 
 // -------------------------------------------------------------------------
 // Configuration
@@ -45,6 +83,22 @@ app.Lifetime.ApplicationStopping.Register(() =>
 // -------------------------------------------------------------------------
 // Middleware
 // -------------------------------------------------------------------------
+app.UseSerilogRequestLogging(options =>
+{
+    options.MessageTemplate = "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms";
+    options.GetLevel = (httpContext, elapsed, ex) => ex != null
+        ? Serilog.Events.LogEventLevel.Error
+        : httpContext.Response.StatusCode > 499
+            ? Serilog.Events.LogEventLevel.Error
+            : Serilog.Events.LogEventLevel.Information;
+    options.EnrichDiagnosticContext = (diagnosticContext, httpContext) =>
+    {
+        diagnosticContext.Set("RequestHost", httpContext.Request.Host.Value);
+        diagnosticContext.Set("RequestScheme", httpContext.Request.Scheme);
+        diagnosticContext.Set("RemoteIP", httpContext.Connection.RemoteIpAddress);
+    };
+});
+
 app.UseMiddleware<TokenAuthMiddleware>();
 
 // -------------------------------------------------------------------------
@@ -192,3 +246,16 @@ static bool IsInCidrRange(IPAddress address, IPAddress network, int prefixLength
 
     return true;
 }
+}
+catch (Exception ex)
+{
+    Log.Fatal(ex, "Application terminated unexpectedly");
+    return 1;
+}
+finally
+{
+    Log.Information("Shutting down frp-ban server");
+    await Log.CloseAndFlushAsync();
+}
+
+return 0;

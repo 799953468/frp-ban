@@ -43,6 +43,7 @@ Edit `src/FrpBan/appsettings.json`:
     "Token": "CHANGE_ME_TO_A_LONG_RANDOM_SECRET",
     "BanFilePath": "/var/lib/frp-ban/bans.json",
     "AccessLogPath": "/var/log/frp-ban/access.log",
+    "AppLogPath": "/var/log/frp-ban/frp-ban-.log",
     "AllowedPluginAddresses": ["127.0.0.1", "::1"],
     "DefaultBanDurationSeconds": 3600
   },
@@ -55,8 +56,32 @@ Edit `src/FrpBan/appsettings.json`:
 | `Token` | Bearer token required for all `/api/*` calls |
 | `BanFilePath` | JSON file used to persist bans across restarts |
 | `AccessLogPath` | Log file monitored by fail2ban (one line per bad request) |
-| `AllowedPluginAddresses` | IPs allowed to call `/handler` (frps itself); empty = allow all |
+| `AppLogPath` | Application log file path (managed by Serilog with auto-rotation) |
+| `AllowedPluginAddresses` | IPs/CIDR allowed to call `/handler` (frps itself); empty = allow all |
 | `DefaultBanDurationSeconds` | Default ban duration; `0` = permanent |
+
+---
+
+## Logging
+
+The application uses **Serilog** for structured logging with automatic rotation:
+
+- **Log Path:** Configured via `PluginSettings.AppLogPath` (default: `/var/log/frp-ban/frp-ban-.log`)
+- **Rotation:** Daily + 100MB file size limit
+- **Retention:** 30 days (production), 7 days (development)
+- **Format:** `YYYY-MM-DD HH:mm:ss.fff [LEVEL] Message`
+
+**View logs:**
+```bash
+# Real-time (systemd)
+sudo journalctl -u frp-ban -f
+
+# Real-time (log file)
+sudo tail -f /var/log/frp-ban/frp-ban-$(date +%Y%m%d).log
+
+# Search errors
+sudo grep -i error /var/log/frp-ban/frp-ban-*.log
+```
 
 ---
 

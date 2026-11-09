@@ -26,6 +26,12 @@ public sealed class PluginSettings
     public string AccessLogPath { get; init; } = "/var/log/frp-ban/access.log";
 
     /// <summary>
+    /// Path to the main application log file (managed by Serilog).
+    /// Used for general application logging with automatic rotation.
+    /// </summary>
+    public string AppLogPath { get; init; } = "/var/log/frp-ban/frp-ban-.log";
+
+    /// <summary>
     /// IP addresses or CIDR prefixes allowed to call the frps plugin endpoint
     /// (POST /handler). Typically only localhost. Empty list = allow all.
     /// </summary>

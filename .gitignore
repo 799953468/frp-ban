@@ -13,6 +13,9 @@ out/
 # Runtime data (never commit real bans or logs)
 *.json.bak
 /var/
+logs/
+data/
+*.log
 
 # Local settings overrides (may contain secrets)
 appsettings.Local.json
