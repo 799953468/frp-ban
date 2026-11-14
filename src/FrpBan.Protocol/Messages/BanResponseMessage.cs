@@ -13,8 +13,11 @@ public sealed record BanResponseMessage(
 {
     protected override byte[] SerializeBody()
     {
-        return JsonSerializer.SerializeToUtf8Bytes(new { Success, Message });
+        return JsonSerializer.SerializeToUtf8Bytes(this, ProtocolJsonContext.Default.BanResponseMessage);
     }
 
-    public static Message FromBody(ReadOnlySpan<byte> body) => DeserializeJson<BanResponseMessage>(body);
+    public static Message FromBody(ReadOnlySpan<byte> body)
+    {
+        return DeserializeJson(body, ProtocolJsonContext.Default.BanResponseMessage);
+    }
 }

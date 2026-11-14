@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace FrpBan.Protocol;
 
@@ -7,7 +9,7 @@ namespace FrpBan.Protocol;
 /// Binary message format: [Type(1B)] [Length(4B)] [Body(variable)]
 /// Maximum message size: 64KB (security limit)
 /// </summary>
-public abstract record Message(MessageType Type)
+public abstract record Message([property: JsonIgnore] MessageType Type)
 {
     /// <summary>
     /// Maximum message body size (64KB - prevents DoS attacks)
@@ -75,11 +77,11 @@ public abstract record Message(MessageType Type)
     /// </summary>
     protected abstract byte[] SerializeBody();
 
-    private static readonly JsonSerializerOptions JsonOptions = new() { RespectNullableAnnotations = true };
-
-    /// <summary>Deserializes a message directly from UTF-8 with non-nullable field validation.</summary>
-    protected static T DeserializeJson<T>(ReadOnlySpan<byte> body) where T : Message =>
-        JsonSerializer.Deserialize<T>(body, JsonOptions) ?? throw new JsonException("Message body cannot be null.");
+    /// <summary>Deserializes a message using generated metadata and non-nullable field validation.</summary>
+    protected static T DeserializeJson<T>(ReadOnlySpan<byte> body, JsonTypeInfo<T> typeInfo) where T : Message
+    {
+        return JsonSerializer.Deserialize(body, typeInfo) ?? throw new JsonException("Message body cannot be null.");
+    }
 
 
     /// <summary>
