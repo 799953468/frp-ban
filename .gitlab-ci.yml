@@ -1,16 +1,22 @@
 default:
-  image: mcr.microsoft.com/dotnet/sdk:11.0
+  # Pin the GA SDK so an older runner cache cannot supply a preview image.
+  image: mcr.microsoft.com/dotnet/sdk:11.0.100@sha256:7913685c883a29dd8ba79da96172f5c6b29ed9be706ebe95935e3ef45f19c9c1
   tags: [server]
 
 variables:
   DOTNET_CLI_TELEMETRY_OPTOUT: '1'
   DOTNET_NOLOGO: '1'
 
-stages: [test, build, publish]
+stages:
+  - test
+  - build
+  - publish
 
 .dotnet:
   before_script:
-    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates zip
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates python3
+    - export PATH="$CI_PROJECT_DIR/.tools:$PATH"
+    - dotnet --version
 
 .release:
   rules:
@@ -20,43 +26,24 @@ test:
   extends: .dotnet
   stage: test
   script:
-    - apt-get install -y --no-install-recommends python3 jq
-    - python3 -m unittest discover -s scripts/tests -v
     - dotnet test FrpBan.slnx -c Release --verbosity normal
-    - dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/server
-    - dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/client
+    - python3 -m unittest discover -s scripts/tests -v
 
-# Managed self-contained publishing supports every target on the Linux runner.
-# Keep each archive in its own job so artifact uploads stay small.
 build:
-  extends: [.dotnet, .release]
+  extends:
+    - .dotnet
+    - .release
   stage: build
   needs: [test]
   parallel:
     matrix:
-      - PROJECT: FrpBan
-        PACKAGE: frp-ban
-        RID: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
-      - PROJECT: FrpBan.Client
-        PACKAGE: frp-ban-client
+      - COMPONENT: [server, client]
         RID: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
   script:
-    - |
-      set -euo pipefail
-      dotnet publish "src/$PROJECT/$PROJECT.csproj" -c Release -r "$RID" \
-        -p:PublishProfile=SelfContained -p:Version="${CI_COMMIT_TAG#v}" -o publish/app
-      cp LICENSE publish/app/LICENSE
-      mkdir -p dist
-      case "$RID" in
-        win-*)
-          (cd publish/app && zip -q -r "../../dist/$PACKAGE-${CI_COMMIT_TAG#v}-$RID.zip" . -x '*.pdb')
-          ;;
-        *)
-          tar --exclude='*.pdb' -czf "dist/$PACKAGE-${CI_COMMIT_TAG#v}-$RID.tar.gz" -C publish/app .
-          ;;
-      esac
+    - case "$RID" in linux-*) bash scripts/install-nfpm.sh ;; esac
+    - python3 scripts/release.py build "$RID" "$CI_COMMIT_TAG" --component "$COMPONENT"
   artifacts:
-    name: $PROJECT-$CI_COMMIT_TAG-$RID
+    name: frp-ban-$CI_COMMIT_TAG-$COMPONENT-$RID
     paths: [dist/]
     expire_in: 7 days
 
@@ -64,10 +51,9 @@ gitlab-release:
   extends: .release
   stage: publish
   resource_group: release
+  image: python:3.12-slim
   needs:
     - job: build
       artifacts: true
-  before_script:
-    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates jq
   script:
-    - bash scripts/publish-gitlab-release.sh
+    - python3 scripts/release.py gitlab "$CI_COMMIT_TAG"

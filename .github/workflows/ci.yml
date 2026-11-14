@@ -20,7 +20,7 @@ jobs:
           dotnet-quality: ga
       - name: Run tests
         run: dotnet test FrpBan.slnx -c Release --verbosity normal
-      - name: Test GitLab release publishing
+      - name: Test release packaging
         run: python3 -m unittest discover -s scripts/tests -v
       - name: Publish server
         run: dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/server

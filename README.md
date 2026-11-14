@@ -426,21 +426,29 @@ without systemd.
 
 ### Release packages
 
-Starting with v1.2.0, tagged releases provide 16 self-contained archives plus
-`SHA256SUMS`: Windows `.zip` and macOS/Linux `.tar.gz` builds for x64 and ARM64,
-including separate glibc and Alpine musl Linux targets. Server (`frp-ban-…`) and
-client (`frp-ban-client-…`) are packaged separately with their .NET runtime.
-Extract the entire archive, including its DLLs and native runtime libraries.
-Client archives also include YAML rules.
+Releases retain the v1.1.0 package formats and layout: 32 installers and portable
+archives plus `SHA256SUMS`. Server (`frp-ban-…`) and client (`frp-ban-client-…`)
+are packaged separately for x64 and ARM64.
 
-Native Linux installers (`.deb`, `.rpm`, `.pkg.tar.zst`, `.apk`) and the old
-portable launchers are no longer published. Extract into a new directory,
-configure `appsettings.json`, and run `FrpBan` or `FrpBan.Client` (`.exe` on
-Windows). Copy existing configuration explicitly when upgrading and update
-service launch paths and working directories. Archives do not install services;
-manual systemd/OpenRC templates remain in `packaging/linux/`.
-See [release notes](packaging/RELEASE_NOTES.md) for the platform matrix and
-upgrade requirements, and [Deployment](#deployment) for service setup.
+| Platform | Formats |
+| --- | --- |
+| Windows | Portable `.zip` |
+| macOS | Portable `.tar.gz` |
+| Linux (glibc) | Portable `.tar.gz`, Debian `.deb`, RPM `.rpm`, Arch `.pkg.tar.zst` |
+| Alpine Linux (musl) | Portable `.tar.gz`, `.apk` |
+
+Every package includes the complete self-contained .NET runtime, configuration,
+license, and release notes. Server packages include `frps.toml.example`; client
+packages include `rules.d`. Portable archives retain their versioned root folder
+and `frp-ban[.cmd]` or `frp-ban-client[.cmd]` launcher, with local data/log paths.
+Extract the entire archive and configure it before using the launcher.
+
+Linux installers retain the dedicated service accounts, `/etc/frp-ban` and
+`/etc/frp-ban-client` configuration, `/opt` application files, command launchers,
+and systemd/OpenRC services. Existing configuration and client rules are preserved
+on package upgrades. Services are not enabled or started automatically.
+See [release notes](packaging/RELEASE_NOTES.md) for software changes and
+[Deployment](#deployment) for service setup.
 
 ### Build
 
@@ -513,15 +521,20 @@ Linux. GitLab uses the existing Docker runner tagged `server`; no Windows,
 macOS, ARM64, or privileged Docker-in-Docker runner is required. Tag a commit
 as `vX.Y.Z` and push that same tag to both remotes to start both release pipelines.
 
-CI invokes `dotnet publish` directly. Release jobs archive its output as ZIP
-(Windows) or TAR.GZ (macOS/Linux), with checksums. GitLab CI uploads its own
-artifacts to the project's generic package registry using `CI_JOB_TOKEN`, then
-creates the release with the English notes in `packaging/RELEASE_NOTES.md`.
-Neither pipeline generates distribution-specific Linux installer packages.
+Both CI providers use the same `scripts/release.py` packaging flow as v1.1.0:
+self-contained publishing, portable launchers and configuration, and nFPM Linux
+installers. The script verifies all 32 packages before writing `SHA256SUMS`.
+GitLab CI uploads its own packages to the project's generic package registry
+using `CI_JOB_TOKEN`, then creates the release with the English notes in
+`packaging/RELEASE_NOTES.md`.
 
 ### Server (systemd)
 
-Extract the server archive into `/opt/frp-ban`, then provision the service account,
+Install the server package for your distribution to provision its service
+account, `/etc/frp-ban` configuration, `/opt/frp-ban` files, and service unit.
+Configure the token and TLS certificate before enabling the service.
+
+For a manual portable-archive installation, extract into `/opt/frp-ban`, then provision the service account,
 configuration and data directories yourself. The service and launcher templates
 are in `packaging/linux/`. Configure the token and TLS certificate before starting
 the service. Archives do not install or enable a system service automatically.
@@ -536,7 +549,11 @@ journalctl -u frp-ban -f
 
 ### Client (systemd)
 
-Extract the client archive into `/opt/frp-ban-client`, then provision its service
+Install the client package for your distribution to provision its service
+account, `/etc/frp-ban-client` configuration and rules, and service unit.
+Configure the connection and log permissions before enabling the service.
+
+For a manual portable-archive installation, extract into `/opt/frp-ban-client`, then provision its service
 account and directories using the templates in `packaging/linux/client/`.
 Configure the server address, token and TLS trust, edit the bundled rules, and
 grant the `frp-ban-client` account read access to monitored logs.

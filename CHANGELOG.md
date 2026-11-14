@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Remove Native AOT compilation and publish server/client as self-contained applications with the target .NET runtime; retain source-generated JSON/configuration handling and the explicit YAML rule parser.
-- Replace the 32-package installer/archive matrix with 16 portable archives for Windows, macOS, Linux glibc and Alpine musl on x64/ARM64, plus SHA256SUMS; retain manual Linux service templates.
+- Retain the v1.1.0 set of 32 installers and portable archives, including launchers, self-contained runtimes, configuration, rules, and Linux service integration.
 - Build directly with shared SelfContained publish profiles, use the .NET 11 GA SDK, and enable runtime async compilation.
 - Build all eight targets independently on Linux in both GitHub and GitLab CI; publish GitLab's own artifacts and checksums to its package registry with automatic release creation.
 - Update Serilog, YamlDotNet and Microsoft.Extensions package versions.

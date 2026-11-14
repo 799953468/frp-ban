@@ -2,7 +2,8 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -18,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate release tag
-        run: '[[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]'
+        run: python3 scripts/release.py validate "$GITHUB_REF_NAME"
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '11.0.x'
@@ -29,15 +30,10 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        app:
-          - {project: FrpBan, package: frp-ban}
-          - {project: FrpBan.Client, package: frp-ban-client}
+        component: [server, client]
         rid: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
     steps:
       - uses: actions/checkout@v4
@@ -45,24 +41,16 @@ jobs:
         with:
           dotnet-version: '11.0.x'
           dotnet-quality: ga
-      - name: Publish self-contained application
-        run: dotnet publish "src/${{ matrix.app.project }}/${{ matrix.app.project }}.csproj" -c Release -r "${{ matrix.rid }}" -p:PublishProfile=SelfContained -p:Version="${GITHUB_REF_NAME#v}" -o publish/app
-      - name: Include license
-        run: cp LICENSE publish/app/LICENSE
-      - name: Archive Windows output
-        if: startsWith(matrix.rid, 'win-')
+      - name: Install Linux packaging tools
+        if: startsWith(matrix.rid, 'linux-')
         run: |
-          mkdir -p dist
-          cd publish/app
-          zip -q -r "../../dist/${{ matrix.app.package }}-${GITHUB_REF_NAME#v}-${{ matrix.rid }}.zip" . -x '*.pdb'
-      - name: Archive Unix output
-        if: ${{ !startsWith(matrix.rid, 'win-') }}
-        run: |
-          mkdir -p dist
-          tar --exclude='*.pdb' -czf "dist/${{ matrix.app.package }}-${GITHUB_REF_NAME#v}-${{ matrix.rid }}.tar.gz" -C publish/app .
+          bash scripts/install-nfpm.sh
+          echo "$PWD/.tools" >> "$GITHUB_PATH"
+      - name: Publish and package ${{ matrix.component }} ${{ matrix.rid }}
+        run: python3 scripts/release.py build "${{ matrix.rid }}" "$GITHUB_REF_NAME" --component "${{ matrix.component }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: frp-ban-${{ matrix.app.project }}-${{ matrix.rid }}
+          name: frp-ban-${{ matrix.component }}-${{ matrix.rid }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
@@ -79,14 +67,18 @@ jobs:
           pattern: frp-ban-*
           path: dist
           merge-multiple: true
-      - name: Write checksums
-        working-directory: dist
-        run: |
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 16
-          sha256sum *.zip *.tar.gz > SHA256SUMS
+      - name: Verify complete asset set and write checksums
+        run: python3 scripts/release.py checksums "$GITHUB_REF_NAME"
       - uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
+          draft: true
           files: dist/*
           fail_on_unmatched_files: true
           body_path: packaging/RELEASE_NOTES.md
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')" -eq 33
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
