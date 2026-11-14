@@ -9,9 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an opt-in ban-management Web UI at `/admin/`, with search, duration filters, pagination, manual bans and confirmed removal.
+- Protect management with a separate token, socket-address allowlist, request limits and browser security headers; embed frontend assets for Native AOT and cover management flows with integration tests.
 - Support Linux systemd journal rules with `logSource.type: journal` and a required `service` unit.
 - Follow new journal message bodies through the existing regex/JSON matching and ban delivery pipeline, with bounded line buffering, concurrent diagnostic draining, and child-process cleanup on shutdown.
 - Document journal permissions, SSH message patterns, startup history behavior, and failure handling; add configuration and monitor regression tests.
+
+### Changed
+
+- Update Serilog, YamlDotNet and Microsoft.Extensions package versions.
 
 ## [1.1.0] - 2026-11-09
 

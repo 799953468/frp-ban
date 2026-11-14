@@ -48,6 +48,9 @@ public sealed class PluginSettings : IValidatableObject
     [Range(1, 1000000)]
     public int MaxBanEntries { get; set; } = 100000;
 
+    /// <summary>Optional browser management UI and its separate authentication settings.</summary>
+    public WebUiSettings WebUi { get; set; } = new();
+
     /// <summary>
     /// TLS/TCP configuration settings for client-server communication.
     /// </summary>
@@ -97,6 +100,18 @@ public sealed class PluginSettings : IValidatableObject
                         $"Invalid ExemptAddresses entry: '{entry}'. Expected an IP address or CIDR network with no host bits set.",
                         [nameof(ExemptAddresses)]);
                 }
+            }
+        }
+
+        if (WebUi is null)
+        {
+            yield return new ValidationResult("WebUi must be a configuration object.");
+        }
+        else
+        {
+            foreach (var result in WebUi.Validate(Token))
+            {
+                yield return result;
             }
         }
 

@@ -10,6 +10,7 @@ High-performance security plugin for [frps](https://github.com/fatedier/frp) tha
 - ✅ **High Performance** — ConcurrentDictionary lookup, pooled bounded frames, cached regexes, event-driven log tailing
 - ✅ **Production Hardened** — Bounded connections and queues, per-IP connection/message limits, handshake deadlines
 - ✅ **Native AOT** — Server and client publish as native executables with no separate .NET runtime installation
+- ✅ **Ban Management UI** — Opt-in browser interface with separate authentication, search, pagination, manual bans and unbanning
 
 ---
 
@@ -134,6 +135,9 @@ Directory.Packages.props      # Central NuGet package versions
 | `AllowedPluginAddresses` | IPs/CIDR allowed to call `/handler` (frps localhost), empty = allow all |
 | `ExemptAddresses` | IPs/CIDR exempt from bans, empty = no exemptions; restart the server after changes |
 | `DefaultBanDurationSeconds` | Default ban duration (seconds), `0` = permanent |
+| `WebUi.Enabled` | Enable the management page and API at `/admin/` (default: `false`) |
+| `WebUi.Token` | Separate management secret, 32–256 printable ASCII characters without spaces; must differ from `Token` |
+| `WebUi.AllowedAddresses` | Socket IPs/CIDRs allowed to access management (default: loopback); empty = any address with valid authentication |
 | `Tls.Enabled` | Enable TLS TCP listener |
 | `Tls.Port` | TLS listener port (default: 9443) |
 | `Logging.LogLevel.Default` | Minimum log level: Debug, Information, Warning, Error |
@@ -154,6 +158,79 @@ TLS deadlines and limits are configured under `PluginSettings.Tls`:
 `MaxConcurrentConnections` (100), `MaxConnectionsPerMinute` (10),
 `MaxMessagesPerMinute` (120), `HandshakeTimeoutSeconds` (10),
 `IdleTimeoutSeconds` (90), and `WriteTimeoutSeconds` (10).
+
+### Web UI for ban management
+
+The server includes a browser UI at `http://127.0.0.1:9000/admin/`. It is **disabled
+by default**. Enable it in `PluginSettings` and configure a separate management
+token before restarting the server:
+
+```json
+"WebUi": {
+  "Enabled": true,
+  "AllowedAddresses": ["127.0.0.1", "::1"]
+}
+```
+
+```bash
+# Generate a separate secret once and keep it in your service's environment.
+# Do not reuse the token distributed to monitoring clients.
+export PluginSettings__WebUi__Token="$(openssl rand -hex 32)"
+# Alternatively, enable the UI through the environment too:
+export PluginSettings__WebUi__Enabled=true
+```
+
+Set these variables in the environment of the **server process** (for an installed
+service, use its service configuration). Open `/admin/` and enter that management
+token. The UI keeps the token only in tab memory, never in cookies or browser
+storage. Reloading, leaving the page, or choosing **Lock session** clears it.
+
+- View active bans, search by IP or reason, filter temporary/permanent bans, and
+  page through results. Use **Refresh** to fetch changes and expired-ban removals.
+- Add IPv4/IPv6 bans with the server default, a preset, a custom duration in
+  seconds, or no expiry. Existing longer/permanent bans are preserved.
+- Remove a ban after confirmation. Monitoring rules can ban an address again if
+  new activity matches. Exempt addresses cannot be banned from the UI.
+- Changes take effect in the same in-memory store as TLS client requests and are
+  saved by the existing asynchronous persistence worker. Persistence failures are
+  retried and logged; a successful API response confirms the in-memory change.
+- Assets are embedded in the executable, including Native AOT builds. No Node.js,
+  separate frontend server, or external CDN is needed at runtime.
+
+For remote administration, keep the server on loopback and use an SSH tunnel:
+
+```bash
+ssh -L 19000:127.0.0.1:9000 user@your-server
+# Then open http://127.0.0.1:19000/admin/ on your machine.
+```
+
+If exposing management through a reverse proxy, terminate HTTPS at the proxy,
+restrict direct access to the backend, and preserve the `/admin/` prefix.
+`WebUi.AllowedAddresses` checks the socket peer (the proxy address), not
+`X-Forwarded-For`; enforce end-user IP restrictions at the proxy. The TLS settings
+for port 9443 do **not** encrypt the HTTP listener. `/handler` keeps its separate
+`AllowedPluginAddresses` policy and does not accept management credentials as a
+substitute for callback address authorization.
+
+The UI uses the following same-origin API. Every API request requires
+`Authorization: Bearer <management-token>`; query-string tokens are not accepted.
+Requests are limited to 120 per socket IP per minute, including failed
+authentication, and request bodies retain the server's 64 KiB limit.
+
+| Method | Route | Behavior |
+|--------|-------|----------|
+| `GET` | `/admin/api/bans` | `search` (up to 256 characters), `kind` (`all`, `temporary`, `permanent`), `page` (1-based), `pageSize` (1–100, default 25) |
+| `POST` | `/admin/api/bans` | JSON: `ip`, `reason` (1–1024 characters), optional `durationSeconds` (`null` = default, `0` = permanent) |
+| `DELETE` | `/admin/api/bans/{ip}` | Remove the URL-encoded IP; succeeds if the ban was already absent |
+
+The list response contains `items`, `total` (matching bans), `page`, `pageSize`,
+`activeCount`, `permanentCount`, and `defaultBanDurationSeconds`. Items use
+`ip`, `reason`, `bannedAt`, `expiresAt`, and `isActive`; times are ISO 8601.
+POST and DELETE return `204` on success. Validation errors return `400`, missing
+or invalid credentials `401`, disallowed addresses `403`, exempt/capacity
+conflicts `409`, oversized bodies `413`, unsupported content types `415`, and
+rate limits `429` with `Retry-After: 60`. All management routes return `404` when
+disabled. Restart after changing management settings or rotating the token.
 
 ### IP whitelist / exemption list
 
@@ -580,7 +657,7 @@ MIT License
 - [x] Systemd journal monitoring support (`type: journal`)
 - [x] IP whitelist/exemption list
 - [ ] Prometheus metrics endpoint
-- [ ] Web UI for ban management
+- [x] Web UI for ban management
 - [ ] Docker/Podman images
 - [ ] Kubernetes Helm chart
 - [ ] Full IPv6 testing

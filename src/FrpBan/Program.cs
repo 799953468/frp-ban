@@ -102,10 +102,11 @@ try
     });
 
     // -------------------------------------------------------------------------
-    // Routes — frps plugin endpoint (ONLY)
+    // Routes — frps plugin callback and optional browser management
     // -------------------------------------------------------------------------
 
     app.MapPluginEndpoints();
+    app.MapManagementEndpoints();
 
     await app.RunAsync();
 }

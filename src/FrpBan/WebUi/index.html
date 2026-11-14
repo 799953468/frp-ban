@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Ban management · frp-ban</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="./app.css">
+    <script src="./app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="topbar">
+    <a class="brand" href="./" aria-label="frp-ban home">frp<span>-ban</span></a>
+    <span class="server-label" id="server-label"></span>
+    <button id="lock-button" class="button subtle" type="button" hidden>Lock session</button>
+</header>
+<main id="main">
+    <noscript><p class="notice error">Enable JavaScript to manage bans in this browser.</p></noscript>
+    <section id="login-panel" class="login-layout" aria-labelledby="login-heading">
+        <div class="login-intro">
+            <h1 id="login-heading">Ban management</h1>
+            <p>Review blocked addresses, add a ban, or restore access to your frp server.</p>
+            <dl class="login-notes">
+                <div>
+                    <dt>One shared ban list</dt>
+                    <dd>Manage the same bans enforced by your frps plugin and monitoring clients.</dd>
+                </div>
+                <div>
+                    <dt>Existing rules apply</dt>
+                    <dd>Exempt addresses stay protected. Temporary bans expire automatically.</dd>
+                </div>
+            </dl>
+        </div>
+        <form id="login-form" class="login-form">
+            <h2>Unlock management</h2>
+            <label for="token">Management token</label>
+            <input id="token" type="password" required minlength="32" maxlength="256" autocomplete="off" spellcheck="false" aria-describedby="token-help" autofocus>
+            <p id="token-help" class="hint">Use the separate WebUi token configured on this server. It stays in memory for this tab and is cleared on reload or lock.</p>
+            <p id="login-error" class="notice error" role="alert" hidden></p>
+            <button id="unlock-button" class="button primary" type="submit">Unlock management</button>
+            <p class="hint connection-help">Connect over HTTPS or a local SSH tunnel to protect your token.</p>
+        </form>
+    </section>
+
+    <section id="management-panel" aria-labelledby="bans-heading" hidden>
+        <div class="heading-row">
+            <div><h1 id="bans-heading" tabindex="-1">Banned addresses</h1>
+                <p class="subtitle">Review active bans and control who can connect.</p></div>
+            <button id="add-button" class="button primary" type="button" aria-expanded="false" aria-controls="create-panel">Add ban</button>
+        </div>
+        <dl class="summary" aria-label="Active ban summary">
+            <div>
+                <dt>Active bans</dt>
+                <dd id="active-count">—</dd>
+            </div>
+            <div>
+                <dt>Temporary</dt>
+                <dd id="temporary-count">—</dd>
+            </div>
+            <div>
+                <dt>Permanent</dt>
+                <dd id="permanent-count">—</dd>
+            </div>
+        </dl>
+
+        <section id="create-panel" class="create-panel" aria-labelledby="create-heading" hidden>
+            <h2 id="create-heading">Add a ban</h2>
+            <p class="hint">Existing bans can only be extended. To shorten one, remove it first.</p>
+            <form id="create-form">
+                <fieldset id="create-fields">
+                    <div class="form-grid">
+                        <div><label for="ip">IP address</label><input id="ip" required maxlength="64" placeholder="192.0.2.10 or 2001:db8::10" autocomplete="off" spellcheck="false"></div>
+                        <div><label for="duration">Duration</label><select id="duration">
+                            <option value="default">Server default</option>
+                            <option value="900">15 minutes</option>
+                            <option value="3600">1 hour</option>
+                            <option value="86400">24 hours</option>
+                            <option value="604800">7 days</option>
+                            <option value="0">Permanent</option>
+                            <option value="custom">Custom duration</option>
+                        </select></div>
+                        <div id="custom-duration-field" hidden><label for="custom-duration">Duration in seconds</label><input id="custom-duration" type="number" min="1" max="2147483647" step="1"
+                                                                                                                              value="3600" disabled></div>
+                        <div class="reason-field"><label for="reason">Reason</label><textarea id="reason" rows="2" required maxlength="1024"
+                                                                                              placeholder="Why is this address being blocked?"></textarea></div>
+                    </div>
+                    <p id="create-error" class="notice error" role="alert" hidden></p>
+                    <div class="form-actions">
+                        <button id="save-button" class="button primary" type="submit">Add ban</button>
+                        <button id="cancel-create" class="button" type="button">Cancel</button>
+                    </div>
+                </fieldset>
+            </form>
+        </section>
+
+        <p id="feedback" class="notice success" role="status" hidden></p>
+        <div class="toolbar">
+            <div class="search-field"><label for="search">Search bans</label><input id="search" type="search" maxlength="256" placeholder="Search IP address or reason" autocomplete="off"></div>
+            <div class="filter-field"><label for="kind">Ban duration</label><select id="kind">
+                <option value="all">All durations</option>
+                <option value="temporary">Temporary</option>
+                <option value="permanent">Permanent</option>
+            </select></div>
+            <button id="refresh-button" class="button" type="button">Refresh</button>
+        </div>
+        <p id="list-error" class="notice error" role="alert" hidden></p>
+        <p id="list-status" class="hint" role="status">Loading bans…</p>
+        <div class="table-region" role="region" aria-label="Banned addresses table" tabindex="0">
+            <table id="ban-table">
+                <caption class="visually-hidden">Active IP bans, their reasons, creation times and expiry times</caption>
+                <thead>
+                <tr>
+                    <th scope="col">IP address</th>
+                    <th scope="col">Reason</th>
+                    <th scope="col">Banned</th>
+                    <th scope="col">Expires</th>
+                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+                </thead>
+                <tbody id="ban-rows"></tbody>
+            </table>
+            <div id="empty-state" class="empty-state" hidden><h2 id="empty-heading"></h2>
+                <p id="empty-description"></p>
+                <button id="clear-filters" class="button" type="button" hidden>Clear filters</button>
+            </div>
+        </div>
+        <div class="pagination"><p id="page-summary" class="hint"></p>
+            <div>
+                <button id="previous-button" class="button" type="button" disabled>Previous</button>
+                <button id="next-button" class="button" type="button" disabled>Next</button>
+            </div>
+        </div>
+        <p class="footer-note">Only active bans are shown. Times use your browser’s time zone. Refresh to update the list.</p>
+    </section>
+</main>
+
+<dialog id="remove-dialog" aria-labelledby="remove-heading" aria-describedby="remove-description">
+    <h2 id="remove-heading">Remove ban?</h2>
+    <p id="remove-description">Allow <strong id="remove-ip"></strong> to connect again. Monitoring rules may ban it again if new activity matches.</p>
+    <p id="remove-error" class="notice error" role="alert" hidden></p>
+    <div class="form-actions">
+        <button id="cancel-remove" class="button" type="button" autofocus>Keep ban</button>
+        <button id="confirm-remove" class="button danger" type="button">Remove ban</button>
+    </div>
+</dialog>
+</body>
+</html>
