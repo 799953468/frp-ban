@@ -1,41 +1,39 @@
 # v1.1.0
 
-This release adds standalone client packages alongside the server for Windows,
-macOS and Linux on x64 and ARM64. It also includes the TLS, protocol validation,
-ban persistence and log monitoring improvements made since v1.0.0.
+Server and client builds use Native AOT for Windows, macOS and Linux on x64 and
+ARM64. Configuration, protocol serialization, YAML rules and ban persistence
+support native compilation without runtime code generation.
 
 ## Release Packages
 
-- GitHub and GitLab share the same release script and build each component for every runtime target.
-- Each release provides 32 native packages or portable archives, plus a `SHA256SUMS` file covering all downloads.
+- GitHub and GitLab invoke `dotnet publish` directly for each component and runtime target.
+- Each release provides 16 archives, plus a `SHA256SUMS` file covering all downloads.
 - Server filenames start with `frp-ban-`; client filenames start with `frp-ban-client-`. Install either component independently or both on the same host.
-- Every package includes the complete self-contained .NET runtime, example configuration and license. Client packages also include YAML rules in `rules.d`.
-- Native Linux client packages include a dedicated service account, launcher and systemd/OpenRC services. Configuration and bundled rules are preserved on upgrade.
+- Every package includes a Native AOT executable, example configuration and license. No separate .NET runtime installation is required. Client packages also include YAML rules in `rules.d`.
+- Archives contain publish output and do not install services or preserve configuration automatically. Linux service templates remain in `packaging/linux/` for manual installation.
 
 | Platform / Distribution | Architectures | Formats (Server and Client) |
 | --- | --- | --- |
 | Windows | x64, ARM64 | `.zip` |
 | macOS | Intel x64, Apple Silicon ARM64 | `.tar.gz` |
-| Debian / Ubuntu | x64, ARM64 | `.deb` |
-| Fedora / RHEL / Rocky / AlmaLinux / openSUSE | x64, ARM64 | `.rpm` |
-| Arch Linux / Arch Linux ARM | x64, ARM64 | `.pkg.tar.zst` |
-| Alpine Linux (musl) | x64, ARM64 | `.apk` |
-| Linux portable (glibc / musl) | x64, ARM64 | `.tar.gz` |
+| Linux (glibc) | x64, ARM64 | `.tar.gz` |
+| Alpine Linux (musl) | x64, ARM64 | `.tar.gz` |
 
-### Arch Linux Installation
+### Running the Applications
 
-Download the components you need. For x64:
+Extract the appropriate archive, configure `appsettings.json`, and run the
+executable from the extracted directory:
 
 ```sh
-sudo pacman -U ./frp-ban-1.1.0-linux-x64.pkg.tar.zst
-sudo pacman -U ./frp-ban-client-1.1.0-linux-x64.pkg.tar.zst
+./FrpBan
+# On the client host:
+./FrpBan.Client
 ```
 
-For Arch Linux ARM, replace `linux-x64` with `linux-arm64` in the filenames.
+On Windows, use `FrpBan.exe` or `FrpBan.Client.exe`.
 
-- Server configuration: `/etc/frp-ban/appsettings.json`; service: `frp-ban`.
-- Client configuration: `/etc/frp-ban-client/appsettings.json`; rules: `/etc/frp-ban-client/rules.d`; service: `frp-ban-client`.
-- Packages do not enable or start services automatically. Configure the token, TLS certificates/trust and log rules first, then run `sudo systemctl enable --now frp-ban` or `sudo systemctl enable --now frp-ban-client` as needed.
+- Set writable ban/log paths and valid TLS certificate paths before starting either application. The server defaults use system directories that may need to be created or changed.
+- Configure the client rules path and monitored log paths for the host.
 - Grant the `frp-ban-client` account read access to monitored logs and search access to their parent directories. Preserve that access after log rotation.
 - The bundled SSH rules use `/var/log/auth.log`; adjust them to your host's log paths. The `journal` log source is not implemented.
 
@@ -62,10 +60,10 @@ For Arch Linux ARM, replace `linux-x64` with `linux-arm64` in the filenames.
 - TLS checks are stricter: configure a trusted CA for private or self-signed certificates, ensure certificate names match the connection address, and provide a valid client certificate when the server requires mTLS.
 - If frps runs on another host, explicitly configure the HTTP listener and trusted callback sources.
 - The client's pending ban queue is held in memory only and is not persisted across process exits.
-- On Windows and macOS, extract the entire archive, configure it, and use `frp-ban[.cmd]` or `frp-ban-client[.cmd]`. Native OS libraries are still required on Linux. Alpine packages are unsigned.
-- See `docs/RELEASING.md` in this tag for complete installation, dependency and configuration instructions. Verify downloads against `SHA256SUMS`.
+- Extract into a new directory when upgrading and copy your existing configuration, certificates and rules explicitly. Native OS libraries are still required on Linux; glibc artifacts are built on Ubuntu 24.04.
+- See `README.md` for build and configuration instructions. Verify downloads against `SHA256SUMS`.
 
 ## Validation
 
-- 115 .NET unit and integration tests pass.
-- 15 release script tests pass, covering both components, eight runtime targets, Arch package configuration, archive contents, checksums and GitLab asset upload logic.
+- 135 .NET unit and integration tests pass, including protocol wire compatibility and YAML scalar handling.
+- Server and client Native AOT publishing was verified on macOS ARM64, including TLS, rule-triggered bans, HTTP callbacks and persistence across restarts.

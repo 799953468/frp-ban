@@ -15,6 +15,9 @@ dist/
 __pycache__/
 dotnet-install.sh
 
+# Local documentation (not committed)
+/docs/
+
 # Runtime data (never commit real bans or logs)
 *.json.bak
 /var/

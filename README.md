@@ -9,6 +9,7 @@ High-performance security plugin for [frps](https://github.com/fatedier/frp) tha
 - ✅ **Rule Engine** — Client monitors log files and triggers bans automatically based on regex patterns
 - ✅ **High Performance** — ConcurrentDictionary lookup, pooled bounded frames, cached regexes, event-driven log tailing
 - ✅ **Production Hardened** — Bounded connections and queues, per-IP connection/message limits, handshake deadlines
+- ✅ **Native AOT** — Server and client publish as native executables with no separate .NET runtime installation
 
 ---
 
@@ -266,12 +267,45 @@ openssl pkcs12 -export -out server.pfx -inkey server-key.pem -in server-cert.pem
 
 ## Deployment
 
+### Native AOT compilation
+
+Build on the target operating system with the .NET 11 SDK and its native C++ toolchain:
+
+```bash
+dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -o publish/aot/server
+dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -o publish/aot/client
+```
+
+Replace `linux-x64` with the appropriate runtime identifier. Native AOT builds
+require the target operating system: Clang and zlib development headers on Linux,
+Xcode command line tools on macOS, or Visual Studio C++ build tools on Windows.
+Build `linux-musl-*` targets inside Alpine on the matching CPU architecture.
+The GitHub glibc builds use Ubuntu 24.04 and require a compatible deployment system.
+
+Both projects include a `Properties/PublishProfiles/NativeAot.pubxml` profile for
+Rider folder publishing. It defaults to the local SDK's runtime identifier and
+publishes into `publish/aot/<project>/<runtime>/`. The same profile works from the CLI:
+
+```bash
+dotnet publish src/FrpBan/FrpBan.csproj -c Release -p:PublishProfile=NativeAot
+dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -p:PublishProfile=NativeAot
+```
+
+GitLab releases require Docker runners tagged `linux-x64` and `linux-arm64`,
+plus shell runners tagged `macos-x64`, `macos-arm64`, `windows-x64` and
+`windows-arm64`. The shell runners must have .NET 11 and the matching
+native compiler installed. Windows runners use PowerShell.
+
+CI invokes `dotnet publish` directly. Release jobs archive its output as ZIP
+(Windows) or TAR.GZ (macOS/Linux), with checksums. They do not run custom release
+programs or generate distribution-specific Linux installer packages.
+
 ### Server (systemd)
 
-Install the appropriate native package using the steps in
-[Release packaging and installation](docs/RELEASING.md). Packages install the
-service, runtime and configuration directories; configure the token and TLS
-certificate before starting the service.
+Extract the server archive into `/opt/frp-ban`, then provision the service account,
+configuration and data directories yourself. The service and launcher templates
+are in `packaging/linux/`. Configure the token and TLS certificate before starting
+the service. Archives do not install or enable a system service automatically.
 
 ```bash
 sudo nano /etc/frp-ban/appsettings.json
@@ -283,14 +317,13 @@ journalctl -u frp-ban -f
 
 ### Client (systemd)
 
-Install the client native package using the steps in
-[Release packaging and installation](docs/RELEASING.md). Configure the server
-address, token and TLS trust, edit the bundled rules, and grant the
-`frp-ban-client` account read access to monitored logs before starting the service.
+Extract the client archive into `/opt/frp-ban-client`, then provision its service
+account and directories using the templates in `packaging/linux/client/`.
+Configure the server address, token and TLS trust, edit the bundled rules, and
+grant the `frp-ban-client` account read access to monitored logs.
 
 ```bash
-# Arch Linux example (use linux-arm64 on Arch Linux ARM)
-sudo pacman -U ./frp-ban-client-1.2.3-linux-x64.pkg.tar.zst
+# After installing and configuring the service manually:
 sudo nano /etc/frp-ban-client/appsettings.json
 sudo nano /etc/frp-ban-client/rules.d/01-ssh-bruteforce.yaml
 # If monitored logs are owned by adm, grant access before starting:
