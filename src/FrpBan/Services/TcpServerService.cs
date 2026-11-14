@@ -216,11 +216,22 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
     private async Task<Message> HandleBanRequestAsync(BanRequestMessage request)
     {
         if (IpAddressUtilities.Normalize(request.Ip) is null || request.DurationSeconds is < 0)
+        {
             return new BanResponseMessage(false, "Invalid IP address or duration");
+        }
+
         if (request.Reason?.Length > 1024)
+        {
             return new BanResponseMessage(false, "Reason exceeds 1024 characters");
+        }
+
         try
         {
+            if (_banService.IsExempt(request.Ip))
+            {
+                return new BanResponseMessage(false, $"IP {request.Ip} is exempt from bans");
+            }
+
             await _banService.BanAsync(request.Ip, request.Reason ?? "client request", request.DurationSeconds)
                 .ConfigureAwait(false);
             return new BanResponseMessage(true, $"Banned {request.Ip}");

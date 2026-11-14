@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using Xunit;
@@ -33,6 +34,29 @@ public class PluginEndpointTests
         using var client = CreateClient(app);
         using var response = await client.PostAsync(path, new StringContent("{broken", Encoding.UTF8, "application/json"));
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ExemptPeer_StillRequiresCallbackAccessPermission()
+    {
+        await using (var bans = new BanService(Options.Create(new PluginSettings
+                     {
+                         ExemptAddresses = ["127.0.0.1", "::1"],
+                         BanFilePath = Path.Combine(Path.GetTempPath(), "frp-ban-exempt-peer-" + Guid.NewGuid() + ".json"),
+                     }), NullLogger<BanService>.Instance))
+        {
+            await using (var app = CreateApplication(["192.0.2.0/24"], bans))
+            {
+                await app.StartAsync();
+                using (var client = CreateClient(app))
+                using (var response = await client.PostAsJsonAsync("/handler", new PluginRequest("0.1.0", "Login",
+                           JsonSerializer.SerializeToElement(new { client_address = "127.0.0.1:1234" }))))
+                {
+                    Assert.True(bans.IsExempt("127.0.0.1"));
+                    Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+                }
+            }
+        }
     }
 
     [Fact]

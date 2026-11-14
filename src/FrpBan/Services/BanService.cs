@@ -4,6 +4,7 @@ using System.Threading.Channels;
 using FrpBan.Configuration;
 using FrpBan.Models;
 using FrpBan.Protocol;
+using FrpBan.Security;
 using Microsoft.Extensions.Options;
 
 namespace FrpBan.Services;
@@ -13,6 +14,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
 {
     private readonly PluginSettings _settings;
     private readonly ILogger<BanService> _logger;
+    private readonly IpExemptionList _exemptions;
     private readonly ConcurrentDictionary<string, BanEntry> _bans = new(StringComparer.Ordinal);
 
     private readonly Channel<byte> _changes = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
@@ -33,6 +35,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
     {
         _settings = settings.Value;
         _logger = logger;
+        _exemptions = new IpExemptionList(_settings.ExemptAddresses);
         _persistenceTask = PersistLoopAsync();
         _cleanupTimer = new Timer(CleanupExpiredBans, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
         _retryTimer = new Timer(_ =>
@@ -42,28 +45,64 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
-    /// <summary>Loads active bans before traffic is accepted; corrupted storage fails startup.</summary>
+    /// <summary>Loads active, non-exempt bans before traffic is accepted; corrupted storage fails startup.</summary>
     public void Load()
     {
         if (!File.Exists(_settings.BanFilePath))
+        {
             return;
-        using var stream = File.OpenRead(_settings.BanFilePath);
-        var entries = JsonSerializer.Deserialize(stream, ServerJsonContext.Default.ListBanEntry)
+        }
+
+        List<BanEntry> entries;
+        using (var stream = File.OpenRead(_settings.BanFilePath))
+        {
+            entries = JsonSerializer.Deserialize(stream, ServerJsonContext.Default.ListBanEntry)
                       ?? throw new InvalidDataException("Ban file must contain a JSON array.");
+        }
+
+        var exemptCount = 0;
         foreach (var entry in entries)
         {
             if (entry is null || !entry.IsActive)
+            {
                 continue;
+            }
+
             var ip = IpAddressUtilities.Normalize(entry.Ip);
             if (ip is null)
+            {
                 throw new InvalidDataException("Ban file contains an invalid IP address.");
+            }
+
+            if (IsExempt(ip))
+            {
+                exemptCount++;
+                continue;
+            }
+
             if (!_bans.ContainsKey(ip) && _bans.Count >= _settings.MaxBanEntries)
+            {
                 throw new InvalidDataException("Ban file exceeds MaxBanEntries.");
+            }
+
             _bans.AddOrUpdate(ip, entry with { Ip = ip }, (_, previous) =>
                 previous.BannedAt > entry.BannedAt ? previous : entry with { Ip = ip });
         }
 
+        // Rewrite only after the entire file has passed validation.
+        if (exemptCount > 0)
+        {
+            MarkDirty();
+            _logger.LogInformation("Removed {Count} persisted bans for exempt addresses", exemptCount);
+        }
+
         _logger.LogInformation("Loaded {Count} active bans", _bans.Count);
+    }
+
+    /// <inheritdoc/>
+    public bool IsExempt(string ip)
+    {
+        return _exemptions.Contains(ip);
     }
 
     /// <inheritdoc/>
@@ -92,6 +131,12 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         lock (_lifecycle)
         {
             ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
+            if (IsExempt(key))
+            {
+                _logger.LogDebug("Ignored ban request for exempt address {Ip}", key);
+                return Task.CompletedTask;
+            }
+
             if (_bans.TryGetValue(key, out var previous))
             {
                 // A ban request may extend protection, but must never shorten or undo it.

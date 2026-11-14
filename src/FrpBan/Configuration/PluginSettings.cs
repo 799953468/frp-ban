@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using FrpBan.Security;
 
 namespace FrpBan.Configuration;
 
@@ -30,6 +31,12 @@ public sealed class PluginSettings : IValidatableObject
     /// (POST /handler). Typically only localhost. Empty list = allow all.
     /// </summary>
     public List<string> AllowedPluginAddresses { get; set; } = ["127.0.0.1", "::1"];
+
+    /// <summary>
+    /// IP addresses or CIDR networks exempt from all bans. Empty means no exemptions.
+    /// Loaded at startup; changes require a server restart.
+    /// </summary>
+    public List<string> ExemptAddresses { get; set; } = [];
 
     /// <summary>
     /// Default ban duration in seconds. 0 means permanent.
@@ -73,6 +80,24 @@ public sealed class PluginSettings : IValidatableObject
         if (MaxBanEntries is < 1 or > 1000000)
         {
             yield return new ValidationResult("MaxBanEntries must be between 1 and 1000000.");
+        }
+
+        if (ExemptAddresses is null)
+        {
+            yield return new ValidationResult("ExemptAddresses must be an array of IP addresses or CIDR networks.",
+                [nameof(ExemptAddresses)]);
+        }
+        else
+        {
+            foreach (var entry in ExemptAddresses)
+            {
+                if (!IpExemptionList.TryParseNetwork(entry, out _))
+                {
+                    yield return new ValidationResult(
+                        $"Invalid ExemptAddresses entry: '{entry}'. Expected an IP address or CIDR network with no host bits set.",
+                        [nameof(ExemptAddresses)]);
+                }
+            }
         }
 
         if (Tls is not null)

@@ -90,6 +90,7 @@ Directory.Packages.props      # Central NuGet package versions
 - **CIDR validation**: Validated prefix lengths (0-32 for IPv4, 0-128 for IPv6)
 - **Production TLS enforcement**: Cannot disable certificate validation in production
 - **Atomic persistence**: One coalescing writer and same-directory atomic file replacement
+- **IP exemptions**: Server-enforced IPv4/IPv6 and CIDR whitelist, including persisted bans
 
 ---
 
@@ -104,6 +105,7 @@ Directory.Packages.props      # Central NuGet package versions
     "BanFilePath": "/var/lib/frp-ban/bans.json",
     "AppLogPath": "/var/log/frp-ban/frp-ban-.log",
     "AllowedPluginAddresses": ["127.0.0.1", "::1", "192.168.1.0/24"],
+    "ExemptAddresses": [],
     "DefaultBanDurationSeconds": 3600,
     "Tls": {
       "Enabled": true,
@@ -130,6 +132,7 @@ Directory.Packages.props      # Central NuGet package versions
 | `BanFilePath` | JSON file path for persistent ban storage |
 | `AppLogPath` | Serilog log file path (auto-rotated) |
 | `AllowedPluginAddresses` | IPs/CIDR allowed to call `/handler` (frps localhost), empty = allow all |
+| `ExemptAddresses` | IPs/CIDR exempt from bans, empty = no exemptions; restart the server after changes |
 | `DefaultBanDurationSeconds` | Default ban duration (seconds), `0` = permanent |
 | `Tls.Enabled` | Enable TLS TCP listener |
 | `Tls.Port` | TLS listener port (default: 9443) |
@@ -151,6 +154,38 @@ TLS deadlines and limits are configured under `PluginSettings.Tls`:
 `MaxConcurrentConnections` (100), `MaxConnectionsPerMinute` (10),
 `MaxMessagesPerMinute` (120), `HandshakeTimeoutSeconds` (10),
 `IdleTimeoutSeconds` (90), and `WriteTimeoutSeconds` (10).
+
+### IP whitelist / exemption list
+
+Set `PluginSettings.ExemptAddresses` on the server to protect trusted addresses
+from all client ban requests. For example:
+
+```json
+"ExemptAddresses": ["192.0.2.10", "198.51.100.0/24", "2001:db8::/32"]
+```
+
+- Supports individual IPv4/IPv6 addresses and CIDR networks. CIDRs must use the
+  network address (for example, `198.51.100.0/24`, not `198.51.100.10/24`). Invalid
+  entries fail startup. Hostnames and addresses with ports are not accepted.
+- IPv4-mapped IPv6 addresses match their IPv4 equivalents. For example,
+  `::ffff:192.0.2.10` matches `192.0.2.10`, and `::ffff:198.51.100.0/120` matches
+  the IPv4 network `198.51.100.0/24`. `0.0.0.0/0` covers IPv4 (including mapped
+  addresses); `::/0` covers native IPv6.
+- An empty list exempts no addresses, including loopback. Changes require a
+  server restart; the list is compiled once at startup.
+- Exempt addresses cannot receive temporary or permanent bans and do not consume
+  ban capacity. Existing active bans for these addresses are skipped on startup
+  and removed from the persisted file after it passes validation. Once that
+  cleanup is persisted, removing an exemption does not restore the old ban.
+- Both `Login` and `NewUserConn` callbacks allow exempt addresses. TLS ban
+  requests return `Success: false` with an explicit exemption message, and the
+  client continues processing later queued requests.
+- `AllowedPluginAddresses` separately controls who can call `/handler`.
+  Exemptions do not bypass callback access checks, TLS authentication, or rate
+  limits, and require no client-side configuration.
+
+Environment variables can also set indexed entries, for example
+`PluginSettings__ExemptAddresses__0=192.0.2.10`.
 
 ### Client (`src/FrpBan.Client/appsettings.json`)
 
@@ -543,7 +578,7 @@ MIT License
 ## Roadmap
 
 - [x] Systemd journal monitoring support (`type: journal`)
-- [ ] IP whitelist/exemption list
+- [x] IP whitelist/exemption list
 - [ ] Prometheus metrics endpoint
 - [ ] Web UI for ban management
 - [ ] Docker/Podman images

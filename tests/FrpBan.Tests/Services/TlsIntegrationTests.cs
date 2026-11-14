@@ -44,7 +44,8 @@ public class TlsIntegrationTests : IAsyncLifetime
         _server = await StartServerAsync();
     }
 
-    private async Task<TcpServerService> StartServerAsync(bool mutualTls = false, int maxMessages = 120)
+    private async Task<TcpServerService> StartServerAsync(bool mutualTls = false, int maxMessages = 120,
+        IBanService? bans = null)
     {
         var server = new TcpServerService(NullLogger<TcpServerService>.Instance, Options.Create(new PluginSettings
         {
@@ -55,7 +56,7 @@ public class TlsIntegrationTests : IAsyncLifetime
                 RequireClientCertificate = mutualTls, ClientCertificateAuthority = AuthorityPath,
                 HandshakeTimeoutSeconds = 2, MaxMessagesPerMinute = maxMessages,
             },
-        }), _bans.Object);
+        }), bans ?? _bans.Object);
         _servers.Add(server);
         await server.StartAsync(CancellationToken.None);
         return server;
@@ -137,6 +138,94 @@ public class TlsIntegrationTests : IAsyncLifetime
         Assert.True(await client.SendBanRequestAsync("::ffff:192.0.2.10", "Weaker request", 1, deadline.Token));
 
         Assert.Equal(original, Assert.Single(store.GetActiveBans()));
+    }
+
+    [Fact]
+    public async Task ExemptBan_ReturnsExplicitRejectionAndKeepsTlsSessionUsable()
+    {
+        await using (var store = new BanService(Options.Create(new PluginSettings
+                     {
+                         BanFilePath = Path.Combine(_directory, "bans.json"),
+                         ExemptAddresses = ["192.0.2.0/24"],
+                     }), NullLogger<BanService>.Instance))
+        {
+            var server = await StartServerAsync(bans: store);
+            using (var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+            using (var client = new TcpClient())
+            {
+                await client.ConnectAsync("127.0.0.1", server.LocalEndpoint!.Port, deadline.Token);
+                using (var tls = new SslStream(client.GetStream(), false, (_, _, _, _) => { return true; }))
+                {
+                    await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                    {
+                        TargetHost = "localhost",
+                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    }, deadline.Token);
+                    var hello = new HelloMessage("1.0", "client",
+                        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Token))));
+                    await tls.WriteAsync(hello.Serialize(), deadline.Token);
+                    Assert.IsType<HelloMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
+
+                    var exemptRequest = new BanRequestMessage("::ffff:192.0.2.1", "exempt", 0);
+                    await tls.WriteAsync(exemptRequest.Serialize(), deadline.Token);
+                    var rejection = Assert.IsType<BanResponseMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
+
+                    Assert.False(rejection.Success);
+                    Assert.Equal("IP ::ffff:192.0.2.1 is exempt from bans", rejection.Message);
+                    Assert.Empty(store.GetActiveBans());
+
+                    var otherRequest = new BanRequestMessage("198.51.100.1", "blocked", 0);
+                    await tls.WriteAsync(otherRequest.Serialize(), deadline.Token);
+                    var accepted = Assert.IsType<BanResponseMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
+
+                    Assert.True(accepted.Success);
+                    Assert.Equal("198.51.100.1", Assert.Single(store.GetActiveBans()).Ip);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ExemptBan_DoesNotBlockQueuedNonExemptBan()
+    {
+        await using (var store = new BanService(Options.Create(new PluginSettings
+                     {
+                         BanFilePath = Path.Combine(_directory, "bans.json"),
+                         ExemptAddresses = ["192.0.2.0/24"],
+                     }), NullLogger<BanService>.Instance))
+        {
+            var server = await StartServerAsync(bans: store);
+            using (var client = CreateClient(server))
+            using (var stopping = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+            {
+                Assert.True(await client.ConnectAsync(stopping.Token));
+                var delivery = new BanDeliveryService(client, Options.Create(new ClientSettings()),
+                    NullLogger<BanDeliveryService>.Instance);
+                await delivery.EnqueueAsync("::ffff:192.0.2.1", "exempt", 0, stopping.Token);
+                await delivery.EnqueueAsync("198.51.100.1", "blocked", 0, stopping.Token);
+                var worker = delivery.RunAsync(stopping.Token);
+                try
+                {
+                    while (!store.IsBanned("198.51.100.1"))
+                    {
+                        await Task.Delay(10, stopping.Token);
+                    }
+
+                    Assert.True(client.IsConnected);
+                    Assert.True(await client.SendPingAsync(stopping.Token));
+                    Assert.False(store.IsBanned("192.0.2.1"));
+                    Assert.Equal("198.51.100.1", Assert.Single(store.GetActiveBans()).Ip);
+                }
+                finally
+                {
+                    await stopping.CancelAsync();
+                    await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                    {
+                        await worker;
+                    });
+                }
+            }
+        }
     }
 
     [Fact]

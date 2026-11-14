@@ -2,6 +2,7 @@ using System.ComponentModel.DataAnnotations;
 using FrpBan.Client.Configuration;
 using FrpBan.Client.Services;
 using FrpBan.Configuration;
+using FrpBan.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -10,6 +11,71 @@ namespace FrpBan.Tests.Configuration;
 
 public class SettingsValidationTests
 {
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("not-an-address")]
+    [InlineData("example.com")]
+    [InlineData("192.0.2.1:80")]
+    [InlineData("192.0.2.0/33")]
+    [InlineData("192.0.2.0/-1")]
+    [InlineData("192.0.2.1/24")]
+    [InlineData("2001:db8::/129")]
+    [InlineData("2001:db8::1/32")]
+    [InlineData("::ffff:192.0.2.0/95")]
+    public void InvalidExemption_FailsStartupValidationAndStoreConstruction(string? entry)
+    {
+        var settings = new PluginSettings
+        {
+            Token = "a-non-placeholder-secret-with-32-characters",
+            ExemptAddresses = [entry!],
+        };
+
+        var result = new PluginSettingsValidator().Validate(null, settings);
+
+        Assert.True(result.Failed);
+        Assert.Contains("ExemptAddresses", result.FailureMessage);
+        Assert.Throws<ArgumentException>(() =>
+        {
+            using (var service = new BanService(Options.Create(settings), NullLogger<BanService>.Instance))
+            {
+                service.Load();
+            }
+        });
+    }
+
+    [Fact]
+    public void NullExemptionList_FailsStartupValidation()
+    {
+        var settings = new PluginSettings
+        {
+            Token = "a-non-placeholder-secret-with-32-characters",
+            ExemptAddresses = null!,
+        };
+
+        var result = new PluginSettingsValidator().Validate(null, settings);
+
+        Assert.True(result.Failed);
+        Assert.Contains("ExemptAddresses", result.FailureMessage);
+    }
+
+    [Fact]
+    public void ValidAndEmptyExemptionLists_PassStartupValidation()
+    {
+        var settings = new PluginSettings
+        {
+            Token = "a-non-placeholder-secret-with-32-characters",
+        };
+        var validator = new PluginSettingsValidator();
+
+        Assert.True(validator.Validate(null, settings).Succeeded);
+
+        settings.ExemptAddresses = ["192.0.2.1", "192.0.2.0/24", "2001:db8::1", "2001:db8::/32", "::ffff:192.0.2.0/120"];
+
+        Assert.True(validator.Validate(null, settings).Succeeded);
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData(" ")]
