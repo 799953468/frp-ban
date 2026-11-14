@@ -20,12 +20,14 @@ public static class PluginEndpoints
                 !filter.IsAllowed(context.Connection.RemoteIpAddress))
             {
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
-                await context.Response.WriteAsJsonAsync(PluginResponse.Deny("not allowed"), context.RequestAborted);
+                await context.Response.WriteAsJsonAsync(PluginResponse.Deny("not allowed"),
+                    ServerJsonContext.Default.PluginResponse, cancellationToken: context.RequestAborted);
                 return;
             }
+
             await next(context);
         });
         app.MapPost("/handler", async ([FromBody] PluginRequest request, HttpContext context, PluginRequestHandler handler) =>
-            Results.Json(await handler.HandleAsync(request, context)));
+        Results.Json(await handler.HandleAsync(request, context), ServerJsonContext.Default.PluginResponse));
     }
 }

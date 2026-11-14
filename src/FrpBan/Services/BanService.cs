@@ -14,18 +14,19 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
     private readonly PluginSettings _settings;
     private readonly ILogger<BanService> _logger;
     private readonly ConcurrentDictionary<string, BanEntry> _bans = new(StringComparer.Ordinal);
+
     private readonly Channel<byte> _changes = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
     {
         SingleReader = true,
         FullMode = BoundedChannelFullMode.DropWrite,
     });
+
     private readonly Timer _cleanupTimer;
     private readonly Timer _retryTimer;
     private readonly Task _persistenceTask;
     private readonly object _lifecycle = new();
     private Task? _disposeTask;
     private int _isDirty;
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     /// <summary>Creates the ban store and starts its single persistence worker.</summary>
     public BanService(IOptions<PluginSettings> settings, ILogger<BanService> logger)
@@ -47,7 +48,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         if (!File.Exists(_settings.BanFilePath))
             return;
         using var stream = File.OpenRead(_settings.BanFilePath);
-        var entries = JsonSerializer.Deserialize<List<BanEntry?>>(stream, JsonOptions)
+        var entries = JsonSerializer.Deserialize(stream, ServerJsonContext.Default.ListBanEntry)
                       ?? throw new InvalidDataException("Ban file must contain a JSON array.");
         foreach (var entry in entries)
         {
@@ -61,6 +62,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             _bans.AddOrUpdate(ip, entry with { Ip = ip }, (_, previous) =>
                 previous.BannedAt > entry.BannedAt ? previous : entry with { Ip = ip });
         }
+
         _logger.LogInformation("Loaded {Count} active bans", _bans.Count);
     }
 
@@ -92,6 +94,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             _bans[key] = entry;
             MarkDirty();
         }
+
         _logger.LogWarning("Banned {Ip}: {Reason}, expires {Expires}", key, reason, entry.ExpiresAt);
         return Task.CompletedTask;
     }
@@ -106,6 +109,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             if (_bans.TryRemove(key, out _))
                 MarkDirty();
         }
+
         return Task.CompletedTask;
     }
 
@@ -132,7 +136,10 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         {
             // Merge bursts of changes instead of scheduling a disk writer per ban.
             await Task.Delay(100).ConfigureAwait(false);
-            while (_changes.Reader.TryRead(out _)) { }
+            while (_changes.Reader.TryRead(out _))
+            {
+            }
+
             await PersistAsync().ConfigureAwait(false);
         }
     }
@@ -153,9 +160,10 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
                              FileShare.None, 16384, FileOptions.Asynchronous | FileOptions.WriteThrough))
             {
-                await JsonSerializer.SerializeAsync(stream, snapshot, JsonOptions).ConfigureAwait(false);
+                await JsonSerializer.SerializeAsync(stream, snapshot, ServerJsonContext.Default.BanEntryArray).ConfigureAwait(false);
                 await stream.FlushAsync().ConfigureAwait(false);
             }
+
             File.Move(temporaryPath, path, overwrite: true);
         }
         catch (Exception ex)
@@ -165,9 +173,16 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         }
         finally
         {
-            try { if (temporaryPath is not null) File.Delete(temporaryPath); }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
+            try
+            {
+                if (temporaryPath is not null) File.Delete(temporaryPath);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
     }
 

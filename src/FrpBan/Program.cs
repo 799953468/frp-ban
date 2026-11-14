@@ -1,6 +1,8 @@
 using FrpBan.Configuration;
 using FrpBan.Endpoints;
 using FrpBan.Handlers;
+using FrpBan.Models;
+using Microsoft.Extensions.Options;
 using FrpBan.Security;
 using FrpBan.Services;
 using Serilog;
@@ -9,7 +11,7 @@ using Serilog.Events;
 // -------------------------------------------------------------------------
 // Configuration Loading
 // -------------------------------------------------------------------------
-var builder = WebApplication.CreateBuilder(args);
+var builder = WebApplication.CreateSlimBuilder(args);
 var config = builder.Configuration;
 
 // Load PluginSettings to get log path
@@ -59,9 +61,10 @@ try
     // -------------------------------------------------------------------------
     // Configuration
     // -------------------------------------------------------------------------
+    builder.Services.ConfigureHttpJsonOptions(options => { options.SerializerOptions.TypeInfoResolverChain.Insert(0, ServerJsonContext.Default); });
+    builder.Services.AddSingleton<IValidateOptions<PluginSettings>, PluginSettingsValidator>();
     builder.Services.AddOptions<PluginSettings>()
         .Bind(builder.Configuration.GetSection("PluginSettings"))
-        .ValidateDataAnnotations()
         .ValidateOnStart();
 
     // -------------------------------------------------------------------------
@@ -116,4 +119,5 @@ finally
     Log.Information("Shutting down frp-ban server");
     await Log.CloseAndFlushAsync();
 }
+
 return 0;

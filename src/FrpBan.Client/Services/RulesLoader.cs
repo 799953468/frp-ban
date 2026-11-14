@@ -1,7 +1,5 @@
 using FrpBan.Client.Configuration;
 using Microsoft.Extensions.Logging;
-using YamlDotNet.Serialization;
-using YamlDotNet.Serialization.NamingConventions;
 
 namespace FrpBan.Client.Services;
 
@@ -12,8 +10,6 @@ namespace FrpBan.Client.Services;
 public sealed class RulesLoader
 {
     private readonly ILogger<RulesLoader> _logger;
-    private readonly IDeserializer _deserializer = new DeserializerBuilder()
-        .WithNamingConvention(CamelCaseNamingConvention.Instance).Build();
 
     public RulesLoader(ILogger<RulesLoader> logger)
     {
@@ -61,12 +57,14 @@ public sealed class RulesLoader
                 _logger.LogError("Ignoring null rule");
                 return false;
             }
+
             var error = RuleValidator.Validate(rule);
             if (error is not null || !names.Add(rule.Name))
             {
                 _logger.LogError("Ignoring rule {Name}: {Error}", rule.Name, error ?? "Duplicate rule name");
                 return false;
             }
+
             return true;
         }).ToList();
         _logger.LogInformation("Loaded {Count} total rule(s)", rules.Count);
@@ -113,7 +111,7 @@ public sealed class RulesLoader
         try
         {
             var yaml = File.ReadAllText(filePath);
-            var config = _deserializer.Deserialize<RulesConfiguration>(yaml);
+            var config = RulesYamlParser.Parse(yaml);
             if (config?.Rules != null)
             {
                 rules = config.Rules;

@@ -49,7 +49,7 @@ public sealed class PluginRequestHandler(
     /// </summary>
     private Task<PluginResponse> HandleLoginAsync(PluginRequest request)
     {
-        var content = request.Content.Deserialize<LoginContent>();
+        var content = request.Content.Deserialize(ServerJsonContext.Default.LoginContent);
         if (content is null)
             return Task.FromResult(PluginResponse.Deny("invalid login payload"));
 
@@ -72,7 +72,7 @@ public sealed class PluginRequestHandler(
     /// </summary>
     private Task<PluginResponse> HandleNewUserConnAsync(PluginRequest request)
     {
-        var content = request.Content.Deserialize<NewUserConnContent>();
+        var content = request.Content.Deserialize(ServerJsonContext.Default.NewUserConnContent);
         if (content is null)
             return Task.FromResult(PluginResponse.Deny("invalid NewUserConn payload"));
 
