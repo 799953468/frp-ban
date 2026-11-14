@@ -329,7 +329,7 @@ public sealed class ManagementEndpointTests
     }
 
     [Fact]
-    public async Task ManagementChanges_PersistAcrossStoreRestart()
+    public async Task ManagementChanges_ArePersistedBeforeSuccessResponse()
     {
         await using (var server = await TestServer.StartAsync())
         {
@@ -338,11 +338,65 @@ public sealed class ManagementEndpointTests
                 Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
             }
 
-            await server.Bans.DisposeAsync();
             await using (var reloaded = new BanService(Options.Create(server.Settings), NullLogger<BanService>.Instance))
             {
                 reloaded.Load();
                 Assert.Equal("Persisted", Assert.Single(reloaded.GetActiveBans()).Reason);
+            }
+
+            using (var response = await server.Client.DeleteAsync("/admin/api/bans/192.0.2.1"))
+            {
+                Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+            }
+
+            await using (var reloaded = new BanService(Options.Create(server.Settings), NullLogger<BanService>.Instance))
+            {
+                reloaded.Load();
+                Assert.Empty(reloaded.GetActiveBans());
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StorageFailure_ReturnsServiceUnavailableAndAllowsRetry(bool removeBan)
+    {
+        await using (var server = await TestServer.StartAsync())
+        {
+            if (removeBan)
+            {
+                await server.Bans.BanAsync("192.0.2.1", "Remove this ban", 0);
+                File.Delete(server.Settings.BanFilePath);
+            }
+
+            Directory.CreateDirectory(server.Settings.BanFilePath);
+            try
+            {
+                using (var response = removeBan
+                           ? await server.Client.DeleteAsync("/admin/api/bans/192.0.2.1")
+                           : await server.Client.PostAsJsonAsync("/admin/api/bans", new { ip = "192.0.2.1", reason = "Persist this ban", durationSeconds = 0 }))
+                {
+                    Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+                    Assert.Contains("could not be saved", await response.Content.ReadAsStringAsync());
+                }
+            }
+            finally
+            {
+                Directory.Delete(server.Settings.BanFilePath);
+            }
+
+            using (var response = removeBan
+                       ? await server.Client.DeleteAsync("/admin/api/bans/192.0.2.1")
+                       : await server.Client.PostAsJsonAsync("/admin/api/bans", new { ip = "192.0.2.1", reason = "Retry", durationSeconds = 0 }))
+            {
+                Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+            }
+
+            await using (var reloaded = new BanService(Options.Create(server.Settings), NullLogger<BanService>.Instance))
+            {
+                reloaded.Load();
+                Assert.Equal(!removeBan, reloaded.IsBanned("192.0.2.1"));
             }
         }
     }

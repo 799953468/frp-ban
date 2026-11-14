@@ -18,13 +18,17 @@ public interface IBanService
     /// <summary>
     /// Adds or extends a ban for the given IP, preserving any existing later expiry or permanent ban.
     /// Valid requests for exempt addresses are ignored.
+    /// Completes after persistence succeeds; storage failures leave changes pending and throw IOException.
     /// </summary>
     /// <param name="ip">The IP address to ban.</param>
     /// <param name="reason">Human-readable reason for the ban.</param>
     /// <param name="durationSeconds">Duration in seconds; 0 is permanent, null uses the configured default.</param>
     Task BanAsync(string ip, string reason, int? durationSeconds = null);
 
-    /// <summary>Removes the ban for the given IP. No-op if not banned.</summary>
+    /// <summary>
+    /// Removes the ban for the given IP and waits for persistence. No-op if not banned and no writes are pending.
+    /// Storage failures leave changes pending and throw IOException.
+    /// </summary>
     Task UnbanAsync(string ip);
 
     /// <summary>Returns a snapshot of all currently active bans.</summary>

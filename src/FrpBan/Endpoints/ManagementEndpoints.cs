@@ -178,6 +178,10 @@ public static class ManagementEndpoints
         {
             return Error("Ban capacity reached. Remove an existing ban before adding another.", StatusCodes.Status409Conflict);
         }
+        catch (IOException)
+        {
+            return Error("Ban changes could not be saved. Check server storage and retry.", StatusCodes.Status503ServiceUnavailable);
+        }
 
         return Results.NoContent();
     }
@@ -190,7 +194,15 @@ public static class ManagementEndpoints
             return Error("Provide a valid IP address.", StatusCodes.Status400BadRequest);
         }
 
-        await bans.UnbanAsync(normalized);
+        try
+        {
+            await bans.UnbanAsync(normalized);
+        }
+        catch (IOException)
+        {
+            return Error("Ban changes could not be saved. Check server storage and retry.", StatusCodes.Status503ServiceUnavailable);
+        }
+
         return Results.NoContent();
     }
 

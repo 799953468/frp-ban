@@ -27,6 +27,8 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
     private readonly Timer _retryTimer;
     private readonly Task _persistenceTask;
     private readonly object _lifecycle = new();
+    private TaskCompletionSource<Exception?>? _pendingPersistence;
+    private TaskCompletionSource<Exception?>? _activePersistence;
     private Task? _disposeTask;
     private int _isDirty;
 
@@ -41,7 +43,9 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         _retryTimer = new Timer(_ =>
         {
             if (Volatile.Read(ref _isDirty) != 0)
+            {
                 _changes.Writer.TryWrite(0);
+            }
         }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
@@ -108,8 +112,16 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
     /// <inheritdoc/>
     public bool IsBanned(string ip)
     {
-        if (string.IsNullOrWhiteSpace(ip)) return false;
-        if (_bans.TryGetValue(ip, out var entry)) return entry.IsActive;
+        if (string.IsNullOrWhiteSpace(ip))
+        {
+            return false;
+        }
+
+        if (_bans.TryGetValue(ip, out var entry))
+        {
+            return entry.IsActive;
+        }
+
         var key = IpAddressUtilities.Normalize(ip);
         return key is not null && key != ip && _bans.TryGetValue(key, out entry) && entry.IsActive;
     }
@@ -128,6 +140,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(duration);
         var now = DateTimeOffset.UtcNow;
         var entry = new BanEntry(key, reason, now, duration == 0 ? null : now.AddSeconds(duration));
+        Task persistence;
         lock (_lifecycle)
         {
             ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
@@ -144,7 +157,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
                 if (previous.ExpiresAt is null ||
                     entry.ExpiresAt is { } requestedExpiry && previous.ExpiresAt >= requestedExpiry)
                 {
-                    return Task.CompletedTask;
+                    return WaitForPersistence();
                 }
             }
             else if (_bans.Count >= _settings.MaxBanEntries)
@@ -154,10 +167,11 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
 
             _bans[key] = entry;
             MarkDirty();
+            persistence = WaitForPersistence();
         }
 
         _logger.LogWarning("Banned {Ip}: {Reason}, expires {Expires}", key, reason, entry.ExpiresAt);
-        return Task.CompletedTask;
+        return persistence;
     }
 
     /// <inheritdoc/>
@@ -168,14 +182,42 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         {
             ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
             if (_bans.TryRemove(key, out _))
+            {
                 MarkDirty();
-        }
+            }
 
-        return Task.CompletedTask;
+            return WaitForPersistence();
+        }
     }
 
     /// <inheritdoc/>
-    public IReadOnlyList<BanEntry> GetActiveBans() => _bans.Values.Where(entry => entry.IsActive).ToArray();
+    public IReadOnlyList<BanEntry> GetActiveBans()
+    {
+        return _bans.Values.Where(entry => entry.IsActive).ToArray();
+    }
+
+    // Called under _lifecycle so a request joins the batch containing its mutation.
+    // Duplicate requests must also wait for an unfinished write, or retry a failed one.
+    private Task WaitForPersistence()
+    {
+        if (Volatile.Read(ref _isDirty) == 0)
+        {
+            return _activePersistence is null ? Task.CompletedTask : EnsurePersistedAsync(_activePersistence.Task);
+        }
+
+        _pendingPersistence ??= new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _changes.Writer.TryWrite(0);
+        return EnsurePersistedAsync(_pendingPersistence.Task);
+    }
+
+    private static async Task EnsurePersistedAsync(Task<Exception?> persistence)
+    {
+        var failure = await persistence.ConfigureAwait(false);
+        if (failure is not null)
+        {
+            throw new IOException("Unable to persist ban changes; changes remain pending for retry.", failure);
+        }
+    }
 
     private void MarkDirty()
     {
@@ -185,10 +227,17 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
 
     private void CleanupExpiredBans(object? state)
     {
-        foreach (var pair in _bans)
-            // Compare both key and value so an expiry sweep cannot delete a refreshed ban.
-            if (!pair.Value.IsActive && ((ICollection<KeyValuePair<string, BanEntry>>)_bans).Remove(pair))
-                MarkDirty();
+        lock (_lifecycle)
+        {
+            foreach (var pair in _bans)
+            {
+                // Compare both key and value so an expiry sweep cannot delete a refreshed ban.
+                if (!pair.Value.IsActive && ((ICollection<KeyValuePair<string, BanEntry>>)_bans).Remove(pair))
+                {
+                    MarkDirty();
+                }
+            }
+        }
     }
 
     private async Task PersistLoopAsync()
@@ -207,17 +256,30 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
 
     private async Task PersistAsync()
     {
-        // Clear before taking the snapshot. Changes during a write stay dirty and queued.
-        if (Interlocked.Exchange(ref _isDirty, 0) == 0)
-            return;
+        TaskCompletionSource<Exception?> completion;
+        IReadOnlyList<BanEntry> snapshot;
+        lock (_lifecycle)
+        {
+            // Capture the snapshot and its waiters together. Later changes belong to the next batch.
+            if (Interlocked.Exchange(ref _isDirty, 0) == 0)
+            {
+                return;
+            }
+
+            snapshot = GetActiveBans();
+            completion = _pendingPersistence ?? new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingPersistence = null;
+            _activePersistence = completion;
+        }
+
         var path = _settings.BanFilePath;
         string? temporaryPath = null;
+        Exception? failure = null;
         try
         {
             path = Path.GetFullPath(path);
             temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            var snapshot = GetActiveBans();
             await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
                              FileShare.None, 16384, FileOptions.Asynchronous | FileOptions.WriteThrough))
             {
@@ -229,20 +291,35 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Interlocked.Exchange(ref _isDirty, 1);
+            failure = ex;
             _logger.LogError(ex, "Failed to persist bans to {Path}; changes remain pending", path);
         }
         finally
         {
             try
             {
-                if (temporaryPath is not null) File.Delete(temporaryPath);
+                if (temporaryPath is not null)
+                {
+                    File.Delete(temporaryPath);
+                }
             }
             catch (IOException)
             {
             }
             catch (UnauthorizedAccessException)
             {
+            }
+
+            lock (_lifecycle)
+            {
+                if (failure is not null)
+                {
+                    Interlocked.Exchange(ref _isDirty, 1);
+                }
+
+                _activePersistence = null;
+                // Background cleanup/retry batches may have no callers to observe a faulted task.
+                completion.SetResult(failure);
             }
         }
     }
@@ -251,7 +328,9 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
     public ValueTask DisposeAsync()
     {
         lock (_lifecycle)
+        {
             return new ValueTask(_disposeTask ??= DisposeCoreAsync());
+        }
     }
 
     private async Task DisposeCoreAsync()
@@ -262,9 +341,14 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         await _persistenceTask.ConfigureAwait(false);
         await PersistAsync().ConfigureAwait(false);
         if (Volatile.Read(ref _isDirty) != 0)
+        {
             throw new IOException("Unable to flush pending bans during shutdown.");
+        }
     }
 
     /// <summary>Synchronous disposal adapter for callers without an asynchronous lifetime.</summary>
-    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+    public void Dispose()
+    {
+        DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
 }

@@ -90,7 +90,7 @@ Directory.Packages.props      # Central NuGet package versions
 - **TLS 1.2/1.3 only**: Disabled outdated protocols
 - **CIDR validation**: Validated prefix lengths (0-32 for IPv4, 0-128 for IPv6)
 - **Production TLS enforcement**: Cannot disable certificate validation in production
-- **Atomic persistence**: One coalescing writer and same-directory atomic file replacement
+- **Atomic persistence**: One coalescing writer and same-directory atomic file replacement; ban/unban requests wait for storage before reporting success
 - **IP exemptions**: Server-enforced IPv4/IPv6 and CIDR whitelist, including persisted bans
 
 ---
@@ -130,7 +130,7 @@ Directory.Packages.props      # Central NuGet package versions
 | Key | Description |
 |-----|-------------|
 | `Token` | TLS client authentication token (use env var `PluginSettings__Token` in production) |
-| `BanFilePath` | JSON file path for persistent ban storage |
+| `BanFilePath` | JSON file path for persistent ban storage; use a stable absolute path writable by the server account |
 | `AppLogPath` | Serilog log file path (auto-rotated) |
 | `AllowedPluginAddresses` | IPs/CIDR allowed to call `/handler` (frps localhost), empty = allow all |
 | `ExemptAddresses` | IPs/CIDR exempt from bans, empty = no exemptions; restart the server after changes |
@@ -141,6 +141,20 @@ Directory.Packages.props      # Central NuGet package versions
 | `Tls.Enabled` | Enable TLS TCP listener |
 | `Tls.Port` | TLS listener port (default: 9443) |
 | `Logging.LogLevel.Default` | Minimum log level: Debug, Information, Warning, Error |
+
+**Ban persistence:**
+
+Ban records are saved automatically to `BanFilePath` (default: `/var/lib/frp-ban/bans.json`).
+Successful ban and unban responses mean the updated list has been written and atomically replaced on disk;
+no shutdown hook is required to save an acknowledged change. On startup, active bans are restored before
+the server accepts traffic. Permanent bans remain permanent, temporary bans retain their original expiry,
+and expired or exempt entries are not restored.
+
+Keep this file on persistent storage and retain the same path across restarts and upgrades. The server
+account needs write permission on its parent directory so it can create and replace the file. If writing
+fails, the management API returns HTTP 503 and the TLS client receives an unsuccessful ban response.
+Changes remain in memory for retry; another request retries pending changes, and the background writer
+also retries every 30 seconds. Invalid JSON prevents startup instead of silently resetting the ban list.
 
 **Production configuration:**
 ```bash
