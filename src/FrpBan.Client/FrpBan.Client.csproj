@@ -1,41 +1,37 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>FrpBan.Client</AssemblyName>
-    <RootNamespace>FrpBan.Client</RootNamespace>
-  </PropertyGroup>
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <AssemblyName>FrpBan.Client</AssemblyName>
+        <RootNamespace>FrpBan.Client</RootNamespace>
+    </PropertyGroup>
 
-  <PropertyGroup>
-    <PublishAot>true</PublishAot>
-    <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
-    <ILLinkTreatWarningsAsErrors>true</ILLinkTreatWarningsAsErrors>
-    <IlcTreatWarningsAsErrors>true</IlcTreatWarningsAsErrors>
-    <WarningsAsErrors>$(WarningsAsErrors);IL2026;IL3050</WarningsAsErrors>
-  </PropertyGroup>
+    <PropertyGroup>
+        <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+    </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Serilog" />
-    <PackageReference Include="Serilog.Sinks.Console" />
-    <PackageReference Include="Serilog.Sinks.File" />
-    <PackageReference Include="Serilog.Extensions.Logging" />
-    <PackageReference Include="YamlDotNet" />
-    <PackageReference Include="Microsoft.Extensions.Configuration" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
-    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
-    <PackageReference Include="Microsoft.Extensions.Logging" />
-  </ItemGroup>
+    <ItemGroup>
+        <PackageReference Include="Serilog"/>
+        <PackageReference Include="Serilog.Sinks.Console"/>
+        <PackageReference Include="Serilog.Sinks.File"/>
+        <PackageReference Include="Serilog.Extensions.Logging"/>
+        <PackageReference Include="YamlDotNet"/>
+        <PackageReference Include="Microsoft.Extensions.Configuration"/>
+        <PackageReference Include="Microsoft.Extensions.Configuration.Binder"/>
+        <PackageReference Include="Microsoft.Extensions.Configuration.Json"/>
+        <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables"/>
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection"/>
+        <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions"/>
+        <PackageReference Include="Microsoft.Extensions.Logging"/>
+    </ItemGroup>
 
-  <ItemGroup>
-    <ProjectReference Include="../FrpBan.Protocol/FrpBan.Protocol.csproj" />
-  </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="../FrpBan.Protocol/FrpBan.Protocol.csproj"/>
+    </ItemGroup>
 
-  <ItemGroup>
-    <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    <None Update="rules.d/**/*.yaml" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-  </ItemGroup>
+    <ItemGroup>
+        <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest"/>
+        <None Update="rules.d/**/*.yaml" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest"/>
+    </ItemGroup>
 
 </Project>

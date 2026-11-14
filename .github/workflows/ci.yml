@@ -20,15 +20,15 @@ jobs:
           dotnet-quality: ga
       - name: Run tests
         run: dotnet test FrpBan.slnx -c Release --verbosity normal
-      - name: Install Native AOT compiler
-        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+      - name: Test GitLab release publishing
+        run: python3 -m unittest discover -s scripts/tests -v
       - name: Publish server
-        run: dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=NativeAot -o publish/server
+        run: dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/server
       - name: Publish client
-        run: dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -p:PublishProfile=NativeAot -o publish/client
+        run: dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/client
       - uses: actions/upload-artifact@v4
         with:
-          name: native-aot-linux-x64
+          name: self-contained-linux-x64
           path: |
             publish/server/
             publish/client/

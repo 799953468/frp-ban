@@ -9,7 +9,7 @@ High-performance security plugin for [frps](https://github.com/fatedier/frp) tha
 - ✅ **Rule Engine** — Client monitors log files and triggers bans automatically based on regex patterns
 - ✅ **High Performance** — ConcurrentDictionary lookup, pooled bounded frames, cached regexes, event-driven log tailing
 - ✅ **Production Hardened** — Bounded connections and queues, per-IP connection/message limits, handshake deadlines
-- ✅ **Native AOT** — Server and client publish as native executables with no separate .NET runtime installation
+- ✅ **Self-contained builds** — Server and client include the .NET runtime; no separate runtime installation is required
 - ✅ **Ban Management UI** — Opt-in browser interface with separate authentication, search, pagination, manual bans and unbanning
 
 ---
@@ -206,9 +206,10 @@ storage. Reloading, leaving the page, or choosing **Lock session** clears it.
 - Remove a ban after confirmation. Monitoring rules can ban an address again if
   new activity matches. Exempt addresses cannot be banned from the UI.
 - Changes take effect in the same in-memory store as TLS client requests and are
-  saved by the existing asynchronous persistence worker. Persistence failures are
-  retried and logged; a successful API response confirms the in-memory change.
-- Assets are embedded in the executable, including Native AOT builds. No Node.js,
+  saved by the asynchronous persistence worker. A successful API response waits
+  for atomic ban-file replacement. Storage failures return HTTP `503`; the
+  in-memory change remains pending for retry, so fix storage and retry the request.
+- Assets are embedded in the server assembly. No Node.js,
   separate frontend server, or external CDN is needed at runtime.
 
 For remote administration, keep the server on loopback and use an SSH tunnel:
@@ -242,9 +243,10 @@ The list response contains `items`, `total` (matching bans), `page`, `pageSize`,
 `ip`, `reason`, `bannedAt`, `expiresAt`, and `isActive`; times are ISO 8601.
 POST and DELETE return `204` on success. Validation errors return `400`, missing
 or invalid credentials `401`, disallowed addresses `403`, exempt/capacity
-conflicts `409`, oversized bodies `413`, unsupported content types `415`, and
-rate limits `429` with `Retry-After: 60`. All management routes return `404` when
-disabled. Restart after changing management settings or rotating the token.
+conflicts `409`, oversized bodies `413`, unsupported content types `415`,
+rate limits `429` with `Retry-After: 60`, and persistence failures `503`.
+All management routes return `404` when disabled. Restart after changing
+management settings or rotating the token.
 
 ### IP whitelist / exemption list
 
@@ -424,12 +426,21 @@ without systemd.
 
 ### Release packages
 
-Tagged releases provide Windows `.zip`, macOS `.tar.gz`, and Linux
-`.deb`, `.rpm`, Arch `.pkg.tar.zst`, Alpine `.apk` and portable `.tar.gz` builds for
-x64 and ARM64. Server (`frp-ban-…`) and client (`frp-ban-client-…`) are packaged
-separately, each with its .NET runtime. Client packages also include YAML rules.
-See [Release packaging and installation](docs/RELEASING.md) for the full matrix,
-configuration steps and GitHub/GitLab CI runner requirements.
+Starting with v1.2.0, tagged releases provide 16 self-contained archives plus
+`SHA256SUMS`: Windows `.zip` and macOS/Linux `.tar.gz` builds for x64 and ARM64,
+including separate glibc and Alpine musl Linux targets. Server (`frp-ban-…`) and
+client (`frp-ban-client-…`) are packaged separately with their .NET runtime.
+Extract the entire archive, including its DLLs and native runtime libraries.
+Client archives also include YAML rules.
+
+Native Linux installers (`.deb`, `.rpm`, `.pkg.tar.zst`, `.apk`) and the old
+portable launchers are no longer published. Extract into a new directory,
+configure `appsettings.json`, and run `FrpBan` or `FrpBan.Client` (`.exe` on
+Windows). Copy existing configuration explicitly when upgrading and update
+service launch paths and working directories. Archives do not install services;
+manual systemd/OpenRC templates remain in `packaging/linux/`.
+See [release notes](packaging/RELEASE_NOTES.md) for the platform matrix and
+upgrade requirements, and [Deployment](#deployment) for service setup.
 
 ### Build
 
@@ -472,38 +483,41 @@ openssl pkcs12 -export -out server.pfx -inkey server-key.pem -in server-cert.pem
 
 ## Deployment
 
-### Native AOT compilation
+### Self-contained publishing
 
-Build on the target operating system with the .NET 11 SDK and its native C++ toolchain:
+Publish with the .NET 11 SDK. The output includes the target platform's .NET
+runtime and uses ordinary managed execution; Native AOT and ReadyToRun are not
+enabled. No target-specific C++ compiler is required:
 
 ```bash
-dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -o publish/aot/server
-dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -o publish/aot/client
+dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/server
+dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/client
 ```
 
-Replace `linux-x64` with the appropriate runtime identifier. Native AOT builds
-require the target operating system: Clang and zlib development headers on Linux,
-Xcode command line tools on macOS, or Visual Studio C++ build tools on Windows.
-Build `linux-musl-*` targets inside Alpine on the matching CPU architecture.
-The GitHub glibc builds use Ubuntu 24.04 and require a compatible deployment system.
+Replace `linux-x64` with `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`,
+`win-x64`, `win-arm64`, `osx-x64`, or `osx-arm64`. The Linux build host can
+publish every target; execution still requires the matching OS and architecture.
+Linux deployments need the native OS libraries required by .NET 11.
 
-Both projects include a `Properties/PublishProfiles/NativeAot.pubxml` profile for
+Both projects include a `Properties/PublishProfiles/SelfContained.pubxml` profile for
 Rider folder publishing. It defaults to the local SDK's runtime identifier and
-publishes into `publish/aot/<project>/<runtime>/`. The same profile works from the CLI:
+publishes into `publish/self-contained/<project>/<runtime>/`. The same profile works from the CLI:
 
 ```bash
-dotnet publish src/FrpBan/FrpBan.csproj -c Release -p:PublishProfile=NativeAot
-dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -p:PublishProfile=NativeAot
+dotnet publish src/FrpBan/FrpBan.csproj -c Release -p:PublishProfile=SelfContained
+dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -p:PublishProfile=SelfContained
 ```
 
-GitLab releases require Docker runners tagged `linux-x64` and `linux-arm64`,
-plus shell runners tagged `macos-x64`, `macos-arm64`, `windows-x64` and
-`windows-arm64`. The shell runners must have .NET 11 and the matching
-native compiler installed. Windows runners use PowerShell.
+GitHub and GitLab independently build both components for all eight targets on
+Linux. GitLab uses the existing Docker runner tagged `server`; no Windows,
+macOS, ARM64, or privileged Docker-in-Docker runner is required. Tag a commit
+as `vX.Y.Z` and push that same tag to both remotes to start both release pipelines.
 
 CI invokes `dotnet publish` directly. Release jobs archive its output as ZIP
-(Windows) or TAR.GZ (macOS/Linux), with checksums. They do not run custom release
-programs or generate distribution-specific Linux installer packages.
+(Windows) or TAR.GZ (macOS/Linux), with checksums. GitLab CI uploads its own
+artifacts to the project's generic package registry using `CI_JOB_TOKEN`, then
+creates the release with the English notes in `packaging/RELEASE_NOTES.md`.
+Neither pipeline generates distribution-specific Linux installer packages.
 
 ### Server (systemd)
 
