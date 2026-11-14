@@ -22,7 +22,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '11.0.x'
-          dotnet-quality: preview
+          dotnet-quality: ga
       - run: dotnet test FrpBan.slnx -c Release --verbosity normal
 
   build:
@@ -52,7 +52,7 @@ jobs:
         if: ${{ !contains(matrix.target.rid, 'musl') }}
         with:
           dotnet-version: '11.0.x'
-          dotnet-quality: preview
+          dotnet-quality: ga
       - name: Install Linux native compiler
         if: startsWith(matrix.target.rid, 'linux-') && !contains(matrix.target.rid, 'musl')
         run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
@@ -66,12 +66,8 @@ jobs:
           RID: ${{ matrix.target.rid }}
         run: |
           docker run --rm -v "$PWD:/src" -w /src -e PROJECT -e RID -e GITHUB_REF_NAME \
-            mcr.microsoft.com/dotnet/sdk:10.0-alpine sh -ec '
-              apk add --no-cache bash clang build-base zlib-dev icu-dev openssl-dev linux-headers curl
-              curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-              bash /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /tmp/dotnet
-              export DOTNET_ROOT=/tmp/dotnet
-              export PATH="$DOTNET_ROOT:$PATH"
+            mcr.microsoft.com/dotnet/sdk:11.0-alpine sh -ec '
+              apk add --no-cache bash clang build-base zlib-dev icu-dev openssl-dev linux-headers
               dotnet publish "src/$PROJECT/$PROJECT.csproj" -c Release -r "$RID" -p:PublishProfile=NativeAot -p:Version="${GITHUB_REF_NAME#v}" -o publish/app
             '
       - name: Include license
