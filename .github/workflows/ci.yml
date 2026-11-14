@@ -2,10 +2,8 @@ name: CI
 
 on:
   push:
-    branches:
-      - '**'
-    tags-ignore:
-      - 'v*'
+    branches: ['**']
+    tags-ignore: ['v*']
   pull_request:
 
 permissions:
@@ -13,23 +11,26 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup .NET 11 (preview)
-        run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 11.0 --quality preview
-          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
-          echo "DOTNET_NOLOGO=1" >> "$GITHUB_ENV"
-          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
-
-      - name: Restore
-        run: dotnet restore FrpBan.slnx
-
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.x'
+          dotnet-quality: preview
       - name: Run tests
-        run: dotnet test FrpBan.slnx --no-restore --verbosity normal
-
-      - name: Test release packaging
-        run: python3 -m unittest discover -s scripts/tests -v
+        run: dotnet test FrpBan.slnx -c Release --verbosity normal
+      - name: Install Native AOT compiler
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+      - name: Publish server
+        run: dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=NativeAot -o publish/server
+      - name: Publish client
+        run: dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -p:PublishProfile=NativeAot -o publish/client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-aot-linux-x64
+          path: |
+            publish/server/
+            publish/client/
+          if-no-files-found: error
+          retention-days: 7

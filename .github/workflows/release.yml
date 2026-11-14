@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -19,38 +18,79 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate release tag
-        run: python3 scripts/release.py validate "$GITHUB_REF_NAME"
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]'
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '11.0.x'
           dotnet-quality: preview
       - run: dotnet test FrpBan.slnx -c Release --verbosity normal
-      - run: python3 -m unittest discover -s scripts/tests -v
 
   build:
     needs: test
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.target.runner }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        component: [server, client]
-        rid: [win-x64, win-arm64, osx-x64, osx-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64]
+        app:
+          - {project: FrpBan, package: frp-ban}
+          - {project: FrpBan.Client, package: frp-ban-client}
+        target:
+          - {rid: win-x64, runner: windows-2025}
+          - {rid: win-arm64, runner: windows-11-arm}
+          - {rid: osx-x64, runner: macos-15-intel}
+          - {rid: osx-arm64, runner: macos-15}
+          - {rid: linux-x64, runner: ubuntu-24.04}
+          - {rid: linux-arm64, runner: ubuntu-24.04-arm}
+          - {rid: linux-musl-x64, runner: ubuntu-24.04}
+          - {rid: linux-musl-arm64, runner: ubuntu-24.04-arm}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        if: ${{ !contains(matrix.target.rid, 'musl') }}
         with:
           dotnet-version: '11.0.x'
           dotnet-quality: preview
-      - name: Install Linux packaging tools
-        if: startsWith(matrix.rid, 'linux-')
+      - name: Install Linux native compiler
+        if: startsWith(matrix.target.rid, 'linux-') && !contains(matrix.target.rid, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+      - name: Publish Native AOT
+        if: ${{ !contains(matrix.target.rid, 'musl') }}
+        run: dotnet publish "src/${{ matrix.app.project }}/${{ matrix.app.project }}.csproj" -c Release -r "${{ matrix.target.rid }}" -p:PublishProfile=NativeAot -p:Version="${GITHUB_REF_NAME#v}" -o publish/app
+      - name: Publish Alpine Native AOT
+        if: contains(matrix.target.rid, 'musl')
+        env:
+          PROJECT: ${{ matrix.app.project }}
+          RID: ${{ matrix.target.rid }}
         run: |
-          bash scripts/install-nfpm.sh
-          echo "$PWD/.tools" >> "$GITHUB_PATH"
-      - name: Publish and package ${{ matrix.component }} ${{ matrix.rid }}
-        run: python3 scripts/release.py build "${{ matrix.rid }}" "$GITHUB_REF_NAME" --component "${{ matrix.component }}"
+          docker run --rm -v "$PWD:/src" -w /src -e PROJECT -e RID -e GITHUB_REF_NAME \
+            mcr.microsoft.com/dotnet/sdk:10.0-alpine sh -ec '
+              apk add --no-cache bash clang build-base zlib-dev icu-dev openssl-dev linux-headers curl
+              curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+              bash /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /tmp/dotnet
+              export DOTNET_ROOT=/tmp/dotnet
+              export PATH="$DOTNET_ROOT:$PATH"
+              dotnet publish "src/$PROJECT/$PROJECT.csproj" -c Release -r "$RID" -p:PublishProfile=NativeAot -p:Version="${GITHUB_REF_NAME#v}" -o publish/app
+            '
+      - name: Include license
+        run: cp LICENSE publish/app/LICENSE
+      - name: Archive Windows output
+        if: startsWith(matrix.target.rid, 'win-')
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          Compress-Archive -Path publish/app/* -DestinationPath "dist/${{ matrix.app.package }}-$version-${{ matrix.target.rid }}.zip"
+      - name: Archive Unix output
+        if: ${{ !startsWith(matrix.target.rid, 'win-') }}
+        run: |
+          mkdir -p dist
+          tar --exclude='*.pdb' --exclude='*.dbg' --exclude='*.dSYM' -czf "dist/${{ matrix.app.package }}-${GITHUB_REF_NAME#v}-${{ matrix.target.rid }}.tar.gz" -C publish/app .
       - uses: actions/upload-artifact@v4
         with:
-          name: frp-ban-${{ matrix.component }}-${{ matrix.rid }}
+          name: frp-ban-${{ matrix.app.project }}-${{ matrix.target.rid }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
@@ -67,10 +107,14 @@ jobs:
           pattern: frp-ban-*
           path: dist
           merge-multiple: true
-      - name: Verify complete asset set and write checksums
-        run: python3 scripts/release.py checksums "$GITHUB_REF_NAME"
+      - name: Write checksums
+        working-directory: dist
+        run: |
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 16
+          sha256sum *.zip *.tar.gz > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          name: ${{ github.ref_name }}
           files: dist/*
           fail_on_unmatched_files: true
           body_path: packaging/RELEASE_NOTES.md
