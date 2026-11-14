@@ -7,17 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-14
+
 ### Added
 
 - Add an opt-in ban-management Web UI at `/admin/`, with search, duration filters, pagination, manual bans and confirmed removal.
-- Protect management with a separate token, socket-address allowlist, request limits and browser security headers; embed frontend assets for Native AOT and cover management flows with integration tests.
+- Protect management with a separate token, socket-address allowlist, request limits and browser security headers; embed frontend assets in the server assembly and cover management flows with integration tests.
+- Add server-side IP/CIDR exemptions for IPv4, IPv6 and mapped IPv4 addresses; reject new bans for exempt addresses and clean up their validated persisted bans at startup.
 - Support Linux systemd journal rules with `logSource.type: journal` and a required `service` unit.
 - Follow new journal message bodies through the existing regex/JSON matching and ban delivery pipeline, with bounded line buffering, concurrent diagnostic draining, and child-process cleanup on shutdown.
 - Document journal permissions, SSH message patterns, startup history behavior, and failure handling; add configuration and monitor regression tests.
 
 ### Changed
 
+- Remove Native AOT compilation and publish server/client as self-contained applications with the target .NET runtime; retain source-generated JSON/configuration handling and the explicit YAML rule parser.
+- Replace the 32-package installer/archive matrix with 16 portable archives for Windows, macOS, Linux glibc and Alpine musl on x64/ARM64, plus SHA256SUMS; retain manual Linux service templates.
+- Build directly with shared SelfContained publish profiles, use the .NET 11 GA SDK, and enable runtime async compilation.
+- Build all eight targets independently on Linux in both GitHub and GitLab CI; publish GitLab's own artifacts and checksums to its package registry with automatic release creation.
 - Update Serilog, YamlDotNet and Microsoft.Extensions package versions.
+
+### Fixed
+
+- Wait for atomic ban-file replacement before acknowledging ban/unban success, including duplicate requests; report storage failures while retaining pending changes for retry.
+- Preserve ban expiry across restarts, retain concurrent persistence updates, and drain pending writes on shutdown.
+- Preserve longer and permanent bans when processing weaker requests; prevent expiry cleanup from deleting concurrently refreshed bans.
+- Harden bundled SSH patterns against misleading username text and unrelated messages, including modern sshd process names and ISO timestamps.
 
 ## [1.1.0] - 2026-11-09
 
@@ -115,6 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auto-reconnect TLS client with exponential backoff
 - Health check (ping/pong) protocol
 
-[Unreleased]: https://github.com/799953468/frp-ban/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/799953468/frp-ban/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/799953468/frp-ban/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/799953468/frp-ban/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/799953468/frp-ban/releases/tag/v1.0.0
