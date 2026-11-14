@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Support Linux systemd journal rules with `logSource.type: journal` and a required `service` unit.
+- Follow new journal message bodies through the existing regex/JSON matching and ban delivery pipeline, with bounded line buffering, concurrent diagnostic draining, and child-process cleanup on shutdown.
+- Document journal permissions, SSH message patterns, startup history behavior, and failure handling; add configuration and monitor regression tests.
+
 ## [1.1.0] - 2026-11-09
 
 ### Added

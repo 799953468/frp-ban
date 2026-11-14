@@ -134,6 +134,55 @@ public class RulesLoaderTests
         Assert.Equal(expectedDuration, rule.Action.BanDurationSeconds);
     }
 
+    [Theory]
+    [InlineData("ssh.service")]
+    [InlineData("sshd.service")]
+    [InlineData("worker@instance.service")]
+    public void JournalRule_LoadsServiceAndUsesTheJournalMonitor(string service)
+    {
+        var rules = LoadYaml($$"""
+                               rules:
+                                 - name: journal-ssh
+                                   logSource:
+                                     type: journal
+                                     service: {{service}}
+                                   matching:
+                                     - pattern: 'Failed from (?<ip>\S+)'
+                               """);
+
+        var rule = Assert.Single(rules);
+        Assert.Equal("journal", rule.LogSource.Type);
+        Assert.Equal(service, rule.LogSource.Service);
+        Assert.Null(rule.LogSource.Path);
+        var monitor = LogMonitor.Create(rule, new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance),
+            _ => Task.CompletedTask, NullLogger.Instance);
+        Assert.IsType<JournalLogMonitor>(monitor);
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("{ type: unknown, path: /tmp/auth.log }")]
+    [InlineData("{ type: file }")]
+    [InlineData("{ type: file, path: ' ' }")]
+    [InlineData("{ type: journal }")]
+    [InlineData("{ type: journal, path: /tmp/auth.log }")]
+    [InlineData("{ type: journal, service: null }")]
+    [InlineData("{ type: journal, service: '' }")]
+    [InlineData("{ type: journal, service: ' ' }")]
+    [InlineData("{ type: journal, service: \"ssh\\0.service\" }")]
+    public void InvalidLogSources_AreRejected(string source)
+    {
+        var rules = LoadYaml($$"""
+                               rules:
+                                 - name: invalid-source
+                                   logSource: {{source}}
+                                   matching:
+                                     - pattern: '(?<ip>\S+)'
+                               """);
+
+        Assert.Empty(rules);
+    }
+
     private static List<FrpBan.Client.Configuration.BanRule> LoadYaml(string yaml)
     {
         var path = Path.Combine(Path.GetTempPath(), $"frp-ban-rules-{Guid.NewGuid():N}.yaml");

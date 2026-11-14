@@ -50,7 +50,8 @@ public sealed class LogSource
     public string? Path { get; init; }
 
     /// <summary>
-    /// Journal service name (for type="journal").
+    /// Required systemd unit name (for type="journal"), for example "sshd.service".
+    /// Matching expressions receive MESSAGE text without journal metadata or a syslog prefix.
     /// </summary>
     public string? Service { get; init; }
 }

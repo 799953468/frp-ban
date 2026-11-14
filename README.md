@@ -232,9 +232,65 @@ a permanent ban must be explicitly removed before a temporary ban can replace it
 
 **Rule options:**
 - `type: file` — Monitor file with FileSystemWatcher (efficient, no polling)
-- `type: journal` — Not implemented; rejected during rule loading
+- `type: journal` — Follow new systemd journal messages for the required `service` unit (Linux only)
 - `action.type: threshold` — Trigger after `maxMatches` in `windowSeconds`
 - `banDurationSeconds: 0` — Permanent ban
+
+### Systemd journal rules
+
+On Linux hosts using systemd, set `logSource.type` to `journal` and specify the
+system unit in `logSource.service`. The client requires `journalctl` on its `PATH`
+and permission to read that unit's journal. No log file or rsyslog setup is needed.
+
+For example, replace the file-based SSH brute-force rule with this journal rule
+(use `sshd.service` instead of `ssh.service` if that is your distribution's unit):
+
+```yaml
+rules:
+  - name: ssh-journal-bruteforce
+    enabled: true
+    logSource:
+      type: journal
+      service: ssh.service
+    matching:
+      - type: regex
+        pattern: '\AFailed password for [^\r\n]* from (?<ip>\S+) port [0-9]+ ssh2(?: \[preauth\])?\z'
+    action:
+      type: threshold
+      maxMatches: 5
+      windowSeconds: 300
+      banDurationSeconds: 3600
+      reason: SSH brute force attempt
+```
+
+Journal rules match the message body (`MESSAGE`) only, without timestamps,
+hostnames, or an `sshd[pid]:` prefix. Adapt file-based expressions accordingly;
+changing only `type` and `service` in a bundled SSH rule is insufficient. For
+applications that log JSON messages, the existing `type: json`, `jsonPath`,
+`jsonValue`, and `ipJsonPath` options operate on that JSON body, not journal metadata.
+Multiline messages are evaluated one line at a time. Matching and threshold
+counting use the same engine as file monitoring.
+
+The monitor follows new messages only (`journalctl --system --follow --lines=0
+--output=cat --no-pager --unit=ssh.service`). Existing entries are not replayed at
+startup or after a client restart, and no journal cursor is persisted. Lines over
+64 Ki characters are discarded. Cancellation terminates and reaps the child
+process. An unexpected `journalctl` exit fails the client so a service supervisor
+can restart it; the supplied systemd template uses `Restart=on-failure`.
+
+Grant the service account journal access and verify it before starting the client:
+
+```bash
+sudo usermod -aG systemd-journal frp-ban-client
+sudo -u frp-ban-client journalctl --system --unit=ssh.service --lines=5 --output=cat --no-pager
+sudo systemctl restart frp-ban-client
+```
+
+Journal group names and ACLs can vary by distribution. Check that the command
+above can read the intended unit. Missing `journalctl`, unsupported platforms,
+and process failures are reported as errors; journal diagnostics are logged as
+warnings. File monitoring remains available on Windows, macOS, and Linux hosts
+without systemd.
 
 ---
 
@@ -486,7 +542,7 @@ MIT License
 
 ## Roadmap
 
-- [ ] Systemd journal monitoring support (`type: journal`)
+- [x] Systemd journal monitoring support (`type: journal`)
 - [ ] IP whitelist/exemption list
 - [ ] Prometheus metrics endpoint
 - [ ] Web UI for ban management
