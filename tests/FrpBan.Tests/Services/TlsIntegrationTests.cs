@@ -112,6 +112,33 @@ public class TlsIntegrationTests : IAsyncLifetime
         _bans.Verify(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()), Times.Never);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(7200)]
+    public async Task ShorterBanRequest_OverTlsPreservesExistingProtection(int originalDuration)
+    {
+        await using var store = new BanService(Options.Create(new PluginSettings
+        {
+            BanFilePath = Path.Combine(_directory, "bans.json"),
+        }), NullLogger<BanService>.Instance);
+        _bans.Setup(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()))
+            .Returns((string ip, string reason, int? duration) =>
+            {
+                return store.BanAsync(ip, reason, duration);
+            });
+        using var client = CreateClient();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        Assert.True(await client.ConnectAsync(deadline.Token));
+        Assert.True(await client.SendBanRequestAsync("192.0.2.10", "Original stronger ban", originalDuration,
+            deadline.Token));
+        var original = Assert.Single(store.GetActiveBans());
+
+        Assert.True(await client.SendBanRequestAsync("::ffff:192.0.2.10", "Weaker request", 1, deadline.Token));
+
+        Assert.Equal(original, Assert.Single(store.GetActiveBans()));
+    }
+
     [Fact]
     public async Task PendingBan_IsDeliveredWhenConnectionBecomesAvailable()
     {

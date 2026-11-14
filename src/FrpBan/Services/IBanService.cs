@@ -11,7 +11,7 @@ public interface IBanService
     bool IsBanned(string ip);
 
     /// <summary>
-    /// Adds or refreshes a ban for the given IP.
+    /// Adds or extends a ban for the given IP, preserving any existing later expiry or permanent ban.
     /// </summary>
     /// <param name="ip">The IP address to ban.</param>
     /// <param name="reason">Human-readable reason for the ban.</param>
@@ -24,4 +24,3 @@ public interface IBanService
     /// <summary>Returns a snapshot of all currently active bans.</summary>
     IReadOnlyList<BanEntry> GetActiveBans();
 }
-

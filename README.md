@@ -197,7 +197,19 @@ rules:
       path: /var/log/auth.log
     matching:
       - type: regex
-        pattern: 'Failed password.*from (?<ip>\d+\.\d+\.\d+\.\d+)'
+        pattern: |-
+          (?x)\A
+          (?:
+            (?:
+              [A-Z][a-z]{2}[ ]+[0-9]{1,2}[ ][0-9]{2}:[0-9]{2}:[0-9]{2}
+              |
+              [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}
+              (?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})
+            )[ ]\S+[ ]
+          )?
+          sshd(?:-session|-auth)?(?:\[[0-9]+\])?:[ ]
+          Failed[ ]password[ ]for[ ][^\r\n]*[ ]from[ ]
+          (?<ip>\S+)[ ]port[ ][0-9]+[ ]ssh2(?:[ ]\[preauth\])?\z
     action:
       type: threshold
       maxMatches: 5
@@ -206,6 +218,17 @@ rules:
       reason: SSH brute force attempt
     maxTrackedIps: 10000
 ```
+
+The bundled SSH rules accept plain `sshd` messages or syslog lines with a hostname
+and an RFC 3164 or RFC 3339 timestamp. They validate the program prefix and match
+the complete connection suffix, supporting IPv4 and IPv6 without treating IP text
+inside a username as the source address. Preserve these boundaries when adapting
+rules to another log format. Existing installations must update their installed
+`rules.d` files and restart the client to use the corrected rules.
+
+Repeated ban requests can only extend an existing expiry or make it permanent.
+A shorter request preserves the stronger ban, including its reason and timestamp;
+a permanent ban must be explicitly removed before a temporary ban can replace it.
 
 **Rule options:**
 - `type: file` — Monitor file with FileSystemWatcher (efficient, no polling)

@@ -81,7 +81,10 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         var key = IpAddressUtilities.Normalize(ip) ?? throw new ArgumentException("Invalid IP address.", nameof(ip));
         ArgumentNullException.ThrowIfNull(reason);
         if (reason.Length > 1024)
+        {
             throw new ArgumentException("Ban reason exceeds 1024 characters.", nameof(reason));
+        }
+
         var duration = durationSeconds ?? _settings.DefaultBanDurationSeconds;
         ArgumentOutOfRangeException.ThrowIfNegative(duration);
         var now = DateTimeOffset.UtcNow;
@@ -89,8 +92,21 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         lock (_lifecycle)
         {
             ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
-            if (!_bans.ContainsKey(key) && _bans.Count >= _settings.MaxBanEntries)
+            if (_bans.TryGetValue(key, out var previous))
+            {
+                // A ban request may extend protection, but must never shorten or undo it.
+                // Retain the original reason and timestamp when its ban is stronger.
+                if (previous.ExpiresAt is null ||
+                    entry.ExpiresAt is { } requestedExpiry && previous.ExpiresAt >= requestedExpiry)
+                {
+                    return Task.CompletedTask;
+                }
+            }
+            else if (_bans.Count >= _settings.MaxBanEntries)
+            {
                 throw new InvalidOperationException("Maximum ban capacity reached.");
+            }
+
             _bans[key] = entry;
             MarkDirty();
         }
