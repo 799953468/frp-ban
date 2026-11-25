@@ -11,6 +11,7 @@ using FrpBan.Protocol;
 using FrpBan.Protocol.Transport;
 using FrpBan.Services;
 using FrpBan.Tests.Security;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -45,9 +46,9 @@ public class TlsIntegrationTests : IAsyncLifetime
     }
 
     private async Task<TcpServerService> StartServerAsync(bool mutualTls = false, int maxMessages = 120,
-        IBanService? bans = null)
+        IBanService? bans = null, ILogger<TcpServerService>? logger = null)
     {
-        var server = new TcpServerService(NullLogger<TcpServerService>.Instance, Options.Create(new PluginSettings
+        var server = new TcpServerService(logger ?? NullLogger<TcpServerService>.Instance, Options.Create(new PluginSettings
         {
             Token = Token,
             Tls = new TlsSettings
@@ -292,6 +293,54 @@ public class TlsIntegrationTests : IAsyncLifetime
         Assert.IsType<ErrorMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
         Assert.Null(await MessageTransport.ReadAsync(tls, deadline.Token));
         _bans.Verify(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task UnknownFrameType_DisconnectsWithoutLoggingAnError()
+    {
+        var logger = new Mock<ILogger<TcpServerService>>();
+        logger.Setup(log => log.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
+        var server = await StartServerAsync(logger: logger.Object);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var client = new TcpClient();
+        await client.ConnectAsync("127.0.0.1", server.LocalEndpoint!.Port, deadline.Token);
+        await using var tls = new SslStream(client.GetStream(), false, (_, _, _, _) => true);
+        await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        {
+            TargetHost = "localhost", EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+        }, deadline.Token);
+        await tls.WriteAsync(new byte[] { 0x7F, 0, 0, 0, 0 }, deadline.Token);
+        Assert.Equal(0, await tls.ReadAsync(new byte[1], deadline.Token));
+        logger.Verify(log => log.Log(LogLevel.Error, It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(),
+            It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task DefaultListener_AcceptsIPv6Clients()
+    {
+        if (!Socket.OSSupportsIPv6)
+        {
+            return;
+        }
+
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var client = new TcpClient(System.Net.Sockets.AddressFamily.InterNetworkV6);
+        await using var tls = await OpenRawTlsAsync(client, "::1", deadline.Token);
+        var hello = new HelloMessage("1.0", "frp-ban-client",
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Token))));
+        await tls.WriteAsync(hello.Serialize(), deadline.Token);
+        Assert.IsType<HelloMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
+    }
+
+    private async Task<SslStream> OpenRawTlsAsync(TcpClient client, string host, CancellationToken cancellationToken)
+    {
+        await client.ConnectAsync(host, _server.LocalEndpoint!.Port, cancellationToken);
+        var tls = new SslStream(client.GetStream(), false, (_, _, _, _) => true);
+        await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        {
+            TargetHost = "localhost", EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+        }, cancellationToken);
+        return tls;
     }
 
     [Fact]

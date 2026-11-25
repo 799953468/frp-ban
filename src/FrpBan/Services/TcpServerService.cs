@@ -70,11 +70,11 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
             _caCertificate = X509CertificateLoader.LoadCertificateFromFile(tls.ClientCertificateAuthority);
 
         _certificateContext = SslStreamCertificateContext.Create(_serverCertificate, null);
-        _listener = new TcpListener(IPAddress.Any, tls.Port);
+        _listener = CreateListener(tls.ListenAddress, tls.Port);
         _listener.Start();
         _listenerTask = ListenForConnectionsAsync(_stopping.Token);
-        _logger.LogInformation("TLS listener started on port {Port}, limit {Limit}",
-            tls.Port, tls.MaxConcurrentConnections);
+        _logger.LogInformation("TLS listener started on {Endpoint}, limit {Limit}",
+            _listener.LocalEndpoint, tls.MaxConcurrentConnections);
         return Task.CompletedTask;
     }
 
@@ -185,7 +185,7 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
                 }
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) when (ex is AuthenticationException or IOException or
+            catch (Exception ex) when (ex is AuthenticationException or IOException or InvalidDataException or
                                        System.Text.Json.JsonException or InvalidOperationException or
                                        ArgumentException or KeyNotFoundException)
             {
@@ -248,6 +248,17 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(_settings.Tls!.WriteTimeoutSeconds));
         await stream.WriteAsync(message.Serialize(), timeout.Token).ConfigureAwait(false);
+    }
+
+    private static TcpListener CreateListener(string listenAddress, int port)
+    {
+        var address = IPAddress.Parse(listenAddress);
+        if (address.Equals(IPAddress.IPv6Any) && !Socket.OSSupportsIPv6)
+            address = IPAddress.Any;
+        var listener = new TcpListener(address, port);
+        if (address.Equals(IPAddress.IPv6Any))
+            listener.Server.DualMode = true;
+        return listener;
     }
 
     private static X509Certificate2 LoadCertificate(string path, string? password, string? keyPath)

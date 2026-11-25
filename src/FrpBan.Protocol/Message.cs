@@ -60,7 +60,7 @@ public abstract record Message([property: JsonIgnore] MessageType Type)
 
         // Security: enforce maximum message size (64KB)
         if (bodyLength > MaxBodySize)
-            throw new InvalidOperationException($"Message body too large: {bodyLength} bytes (max: {MaxBodySize})");
+            throw new InvalidDataException($"Message body too large: {bodyLength} bytes (max: {MaxBodySize})");
 
         var totalLength = 5 + (int)bodyLength;
         if (totalLength > buffer.Length)
@@ -97,7 +97,7 @@ public abstract record Message([property: JsonIgnore] MessageType Type)
             MessageType.Ping => PingMessage.FromBody(body),
             MessageType.Pong => PongMessage.FromBody(body),
             MessageType.Error => ErrorMessage.FromBody(body),
-            _ => throw new InvalidOperationException($"Unknown message type: {type}"),
+            _ => throw new InvalidDataException($"Unknown message type: {type}"),
         };
     }
 }

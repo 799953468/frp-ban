@@ -213,6 +213,7 @@ internal static class RulesYamlParser
         }
 
         text = text.Replace("_", "", StringComparison.Ordinal);
+        // Leading zeros are decimal: "0600" seconds means 600, not YAML 1.1 octal 384.
         ulong magnitude;
         if (text.StartsWith("0x", StringComparison.Ordinal))
         {
@@ -221,10 +222,6 @@ internal static class RulesYamlParser
         else if (text.StartsWith("0b", StringComparison.Ordinal))
         {
             magnitude = Convert.ToUInt64(text[2..], 2);
-        }
-        else if (text.Length > 1 && text[0] == '0')
-        {
-            magnitude = Convert.ToUInt64(text[1..], 8);
         }
         else
         {

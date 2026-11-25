@@ -146,6 +146,12 @@ public sealed class TlsSettings : IValidatableObject
     public int Port { get; set; } = 9443;
 
     /// <summary>
+    /// IP address for the TLS listener. The default "::" accepts IPv6 and IPv4 (dual-stack),
+    /// falling back to 0.0.0.0 when the host has no IPv6 support.
+    /// </summary>
+    public string ListenAddress { get; set; } = "::";
+
+    /// <summary>
     /// Path to the server TLS certificate file (.pfx or .pem).
     /// </summary>
     public string? CertificatePath { get; set; }
@@ -203,6 +209,11 @@ public sealed class TlsSettings : IValidatableObject
             WriteTimeoutSeconds is < 1 or > 300)
         {
             yield return new ValidationResult("Invalid TLS port, limits, or timeouts.");
+        }
+
+        if (!System.Net.IPAddress.TryParse(ListenAddress, out _))
+        {
+            yield return new ValidationResult($"Invalid TLS ListenAddress: '{ListenAddress}'.");
         }
 
         if (Enabled && TcpListenerEnabled && string.IsNullOrWhiteSpace(CertificatePath))

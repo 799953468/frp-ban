@@ -34,7 +34,8 @@ var minLogLevel = logLevel.ToLowerInvariant() switch
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Is(minLogLevel)
     .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
-    .MinimumLevel.Override("Microsoft.AspNetCore.Hosting", LogEventLevel.Information)
+    // UseSerilogRequestLogging below replaces ASP.NET's per-request "starting/finished" lines.
+    .MinimumLevel.Override("Microsoft.Hosting.Lifetime", LogEventLevel.Information)
     .MinimumLevel.Override("System.Net.Http.HttpClient", LogEventLevel.Warning)
     .Enrich.FromLogContext()
     .WriteTo.Async(a => a.Console(
@@ -88,11 +89,12 @@ try
     app.UseSerilogRequestLogging(options =>
     {
         options.MessageTemplate = "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms";
-        options.GetLevel = (httpContext, elapsed, ex) => ex != null
-            ? Serilog.Events.LogEventLevel.Error
-            : httpContext.Response.StatusCode > 499
-                ? Serilog.Events.LogEventLevel.Error
-                : Serilog.Events.LogEventLevel.Information;
+        // frps calls /handler for every user connection; keep routine callbacks out of Information logs.
+        options.GetLevel = (httpContext, _, ex) => ex is not null || httpContext.Response.StatusCode > 499
+            ? LogEventLevel.Error
+            : httpContext.Request.Path.StartsWithSegments("/handler")
+                ? LogEventLevel.Debug
+                : LogEventLevel.Information;
         options.EnrichDiagnosticContext = (diagnosticContext, httpContext) =>
         {
             diagnosticContext.Set("RequestHost", httpContext.Request.Host.Value);

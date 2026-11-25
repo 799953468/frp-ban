@@ -111,7 +111,8 @@ public class RulesLoaderTests
 
     [Theory]
     [InlineData("yes", "0x78", true, 120)]
-    [InlineData("ON", "0170", true, 120)]
+    [InlineData("ON", "0120", true, 120)]
+    [InlineData("true", "0600", true, 600)]
     [InlineData("n", "0b1111000", false, 120)]
     [InlineData("off", "2:00", false, 120)]
     [InlineData("true", "1_200", true, 1200)]
