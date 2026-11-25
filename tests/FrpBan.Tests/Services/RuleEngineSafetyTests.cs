@@ -101,7 +101,7 @@ public class RuleEngineSafetyTests
         };
         Assert.Empty(engine.ProcessLogLine(new string('a', 20000) + "!", rule));
         Assert.Contains(logger.Invocations, invocation => invocation.Method.Name == "Log" &&
-            invocation.Arguments[2].ToString()!.Contains("timed out", StringComparison.Ordinal));
+            invocation.Arguments[2]?.ToString()?.Contains("timed out", StringComparison.Ordinal) == true);
     }
 
     private sealed class ManualTime : TimeProvider

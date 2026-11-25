@@ -111,6 +111,7 @@ Directory.Packages.props      # Central NuGet package versions
     "Tls": {
       "Enabled": true,
       "TcpListenerEnabled": true,
+      "ListenAddress": "::",
       "Port": 9443,
       "CertificatePath": "/etc/frp-ban/certs/server.pfx",
       "CertificatePassword": "your-cert-password",
@@ -132,13 +133,14 @@ Directory.Packages.props      # Central NuGet package versions
 | `Token` | TLS client authentication token (use env var `PluginSettings__Token` in production) |
 | `BanFilePath` | JSON file path for persistent ban storage; use a stable absolute path writable by the server account |
 | `AppLogPath` | Serilog log file path (auto-rotated) |
-| `AllowedPluginAddresses` | IPs/CIDR allowed to call `/handler` (frps localhost), empty = allow all |
+| `AllowedPluginAddresses` | IPs/CIDR allowed to call `/handler` (frps localhost), empty = allow all; invalid entries or CIDRs with host bits set fail startup |
 | `ExemptAddresses` | IPs/CIDR exempt from bans, empty = no exemptions; restart the server after changes |
 | `DefaultBanDurationSeconds` | Default ban duration (seconds), `0` = permanent |
 | `WebUi.Enabled` | Enable the management page and API at `/admin/` (default: `false`) |
 | `WebUi.Token` | Separate management secret, 32–256 printable ASCII characters without spaces; must differ from `Token` |
 | `WebUi.AllowedAddresses` | Socket IPs/CIDRs allowed to access management (default: loopback); empty = any address with valid authentication |
 | `Tls.Enabled` | Enable TLS TCP listener |
+| `Tls.ListenAddress` | TLS listener address (default: `::`, dual-stack IPv6 + IPv4; falls back to `0.0.0.0` without IPv6). Use e.g. `10.0.0.1` to bind one interface |
 | `Tls.Port` | TLS listener port (default: 9443) |
 | `Logging.LogLevel.Default` | Minimum log level: Debug, Information, Warning, Error |
 
@@ -307,8 +309,15 @@ Environment variables can also set indexed entries, for example
 }
 ```
 
+TLS is always used; the former `Tls.Enabled` key is no longer read.
 Client certificates are optional unless the server requires mTLS. Configure
 `CaCertificatePath` for a private CA; otherwise system trust is used.
+Log monitors start immediately, even while the server is unreachable, so attacks
+detected during an outage are queued and delivered after the client connects.
+The client reads `appsettings.json` from its working directory, then environment
+variables (`ClientSettings__Token=...`) and command-line arguments
+(`--ClientSettings:ServerAddress=frps.example.com`). Invalid settings, or rule
+sources with no valid enabled rule, stop the client with exit code 1.
 `ConnectionTimeoutSeconds` defaults to 15, `RequestTimeoutSeconds` to 10, and
 `MaxPendingBans` to 1024. Queued bans retry after reconnection and remain in memory
 only; normal process shutdown drains tasks but does not persist this client queue.
@@ -675,7 +684,21 @@ throughput, and memory usage depend on workload and require measurement.
 - `0x05` PONG — Health check response
 - `0x06` ERROR — Error message
 
-**Body Format**: JSON (UTF-8)
+**Body Format**: JSON (UTF-8). Unknown message types and oversized frames close the session.
+
+**Version**: HELLO carries protocol version `2.0`; the server rejects any other version.
+Version 2.0 is not compatible with 1.x clients, so upgrade clients and server together.
+
+**BAN_RESPONSE** carries `{"Status": "...", "Message": "..."}`:
+
+| Status | Meaning | Client action |
+|--------|---------|---------------|
+| `Applied` | Ban added or extended and persisted | Done |
+| `AlreadyBanned` | An equal or stronger ban already exists and is persisted | Done |
+| `Exempt` | Address is in `ExemptAddresses` | Drop |
+| `Invalid` | Invalid IP, reason (1–1024 characters), or negative duration | Drop |
+| `CapacityReached` | `MaxBanEntries` reached | Drop |
+| `StorageUnavailable` | Ban is active in memory but not yet persisted | Retry later |
 
 ---
 

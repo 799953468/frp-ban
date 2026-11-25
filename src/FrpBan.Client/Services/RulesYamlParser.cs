@@ -5,7 +5,10 @@ using YamlDotNet.RepresentationModel;
 
 namespace FrpBan.Client.Services;
 
-/// <summary>Maps the YAML document to rules without runtime reflection or dynamic code.</summary>
+/// <summary>
+/// Maps a rule file to <see cref="RulesConfiguration"/>. Unknown keys are rejected rather than ignored,
+/// so a misspelled setting (for example "maxMatch") cannot silently fall back to a default.
+/// </summary>
 internal static class RulesYamlParser
 {
     public static RulesConfiguration? Parse(string yaml)

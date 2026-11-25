@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- Protocol version 2.0: `BAN_RESPONSE` replaces `Success` with a `Status` (`Applied`, `AlreadyBanned`, `Exempt`, `Invalid`, `CapacityReached`, `StorageUnavailable`). 1.x clients are rejected at HELLO; upgrade clients and server together.
+- `AllowedPluginAddresses` is now validated like `ExemptAddresses`: invalid entries and CIDRs with host bits set (for example `10.0.0.1/8`) fail startup with the setting name in the error.
+- Rule integers with a leading zero are decimal: `windowSeconds: 0600` now means 600 seconds, not octal 384.
+- The client no longer reads `ClientSettings.Tls.Enabled`; TLS is always on.
+
+### Added
+
+- `Tls.ListenAddress` for the server TLS listener. The default `::` accepts IPv6 and IPv4 clients (previously IPv4 only).
+
+### Changed
+
+- The client runs on the .NET Generic Host: configuration also accepts command-line arguments, and startup validation errors are reported once, concisely.
+- Rules are validated and compiled once at load time; each rule owns its threshold counters. Invalid rules and unreadable rule files are still logged and skipped.
+- Ban validation lives only in the server ban store. TCP and management callers map its result, and the persisted ban file is the only indented JSON.
+- frps `/handler` callbacks are logged at Debug instead of two Information lines per user connection.
+- Use stable Serilog 4.4.0 and Serilog.Sinks.File 7.0.0 instead of development builds.
+
+### Fixed
+
+- Log monitors start immediately instead of after the first successful connection, so attack lines written while the server was unreachable are no longer skipped.
+- An unauthenticated peer sending an unknown frame type no longer produces an Error log entry.
+- A management request during shutdown no longer reports "Ban capacity reached".
+- A ban whose persistence failed is retried by the client instead of being dropped as rejected.
+
 ## [1.2.0] - 2026-11-14
 
 ### Added
