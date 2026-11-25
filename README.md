@@ -1,103 +1,205 @@
+<div align="center">
+
 # frp-ban
 
-High-performance security plugin for [frps](https://github.com/fatedier/frp) that blocks banned IP addresses using a TLS-encrypted custom TCP protocol for distributed IP ban management.
+**Distributed IP banning for [frp](https://github.com/fatedier/frp) — stop attackers at the frps edge before they reach your tunnels.**
+
+[![CI](https://github.com/799953468/frp-ban/actions/workflows/ci.yml/badge.svg)](https://github.com/799953468/frp-ban/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/799953468/frp-ban?sort=semver)](https://github.com/799953468/frp-ban/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![.NET](https://img.shields.io/badge/.NET-11-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
+![Platforms](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-lightgrey)
+
+[Quick Start](#quick-start) ·
+[Configuration](#configuration) ·
+[Web UI](#web-ui) ·
+[Protocol](#protocol) ·
+[Changelog](CHANGELOG.md)
+
+</div>
+
+---
+
+## Overview
+
+When you expose services such as SSH through frp, attack traffic is logged on the
+machine running **frpc**, but it enters through **frps**. Local tools like fail2ban
+cannot block it at the source, because every connection appears to come from frpc.
+
+**frp-ban** closes that gap:
+
+- **`frp-ban-client`** runs next to your services, watches their logs (files or the
+  systemd journal), and detects attacks using YAML rules.
+- **`frp-ban`** (server) runs next to frps as an [HTTP server plugin](https://github.com/fatedier/frp/blob/dev/doc/server_plugin.md).
+  It receives ban requests from clients over TLS and rejects banned IPs at the frps
+  `Login` and `NewUserConn` stages.
+
+```
+   Client host                                       frps host
+ ┌──────────────────────────────┐              ┌──────────────────────────────┐
+ │ sshd / nginx / ...           │              │ frps (:7000)                 │
+ │   │ logs                     │   frp tunnel │   │ Login / NewUserConn      │
+ │   ▼                          │◄────────────►│   ▼                          │
+ │ frp-ban-client               │              │ frp-ban                      │
+ │   ├─ rules.d/*.yaml          │     TLS      │   ├─ POST /handler (:9000)   │
+ │   ├─ file / journal monitors │─────────────►│   ├─ TLS listener (:9443)    │
+ │   └─ retry queue + backoff   │  ban request │   ├─ in-memory ban list      │
+ │                              │              │   └─ bans.json (persistent)  │
+ └──────────────────────────────┘              └──────────────────────────────┘
+```
+
+1. frps calls `POST /handler` on frp-ban before every `Login` and `NewUserConn`.
+2. frp-ban looks up the source IP in its in-memory ban list and rejects banned IPs.
+3. frp-ban-client matches log lines against rules and sends a ban request over TLS when a threshold is reached.
+4. The server persists the ban and blocks the IP on subsequent connections.
 
 ## Features
 
-- ✅ **Frp Plugin Integration** — Intercepts banned IPs at frps Login/NewUserConn stage
-- ✅ **TLS Encrypted Communication** — Binary protocol + TLS 1.2/1.3 between server and clients
-- ✅ **Rule Engine** — Client monitors log files and triggers bans automatically based on regex patterns
-- ✅ **High Performance** — ConcurrentDictionary lookup, pooled bounded frames, cached regexes, event-driven log tailing
-- ✅ **Production Hardened** — Bounded connections and queues, per-IP connection/message limits, handshake deadlines
-- ✅ **Self-contained builds** — Server and client include the .NET runtime; no separate runtime installation is required
-- ✅ **Ban Management UI** — Opt-in browser interface with separate authentication, search, pagination, manual bans and unbanning
+- 🛡️ **frps plugin integration** — Rejects banned IPs at `Login` and `NewUserConn`, before a tunnel or user connection is established.
+- 🔐 **TLS-encrypted protocol** — Compact binary framing over TLS 1.2/1.3, token authentication, optional mutual TLS.
+- 📜 **Rule engine** — YAML rules with regex or JSON matching and sliding-window thresholds, applied to log files or systemd journal units.
+- 🌐 **IPv4 and IPv6** — Canonical address handling, CIDR exemptions, IPv4-mapped IPv6 support.
+- 💾 **Durable bans** — Atomic persistence; temporary bans keep their original expiry across restarts.
+- 🖥️ **Web UI** — Opt-in management page for searching, adding, and removing bans, with its own token.
+- 🧱 **Hardened by default** — Bounded connections, queues, and frames; per-IP rate limits; handshake and idle deadlines.
+- 📦 **Self-contained** — Ships with the .NET runtime. Packages for deb, rpm, Arch, Alpine, plus portable archives for Linux, Windows, and macOS.
 
----
+## Table of Contents
 
-## Architecture
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Configuration](#configuration)
+  - [Server](#server)
+  - [IP exemptions](#ip-exemptions)
+  - [Web UI](#web-ui)
+  - [Client](#client)
+  - [Ban rules](#ban-rules)
+  - [Systemd journal rules](#systemd-journal-rules)
+- [Operations](#operations)
+- [Security](#security)
+- [Protocol](#protocol)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
 
-```
- CLIENT MACHINE (FrpBan.Client)          FRP SERVER
- ┌──────────────────────────────┐       ┌──────────────────────────────────┐
- │ frpc                          │       │ frps (:7000)                     │
- │   │                           │       │   │ plugin callbacks              │
- │   ▼ frp tunnel                │◄─────►│   ▼                               │
- │ services (SSH, web, ...)      │       │ FrpBan (:9000 HTTP, :9443 TLS)  │
- │                               │       │   POST /handler  (Login/NewUser)  │
- │ FrpBan.Client                 │       │                                   │
- │  ├─ Log monitors (rules.d/)   │       │ BanService (ConcurrentDict)      │
- │  │   FileSystemWatcher        │       │   ├─ IsBanned() O(1) lookup      │
- │  │   rule matching engine     │       │   └─ Auto-expire expired bans    │
- │  ▼                            │       │                                   │
- │  TLS client ──────────────────┼──────►│ TCP server (:9443)               │
- │    auto-reconnect             │       │   ├─ TLS 1.2/1.3 only            │
- │    health check (ping/pong)   │       │   ├─ Connection + message limits  │
- │    exponential backoff        │       │   └─ Connection pool (max 100)   │
- └──────────────────────────────┘       └──────────────────────────────────┘
-```
+## Quick Start
 
-**Workflow:**
-1. frps calls FrpBan's `POST /handler` before each `Login` and `NewUserConn` operation
-2. FrpBan checks in-memory ban list, rejects banned IPs from establishing tunnels
-3. Client FrpBan.Client monitors log files, sends ban requests via TLS connection when attack patterns match
-4. Server receives ban requests, updates memory and persistent storage, blocks that IP from subsequent connections
+The following steps use the Linux packages and systemd. See [Installation](#installation) for other platforms.
 
----
+**1. Install the server on the frps host**
 
-## Project Structure
+Download a package from [Releases](https://github.com/799953468/frp-ban/releases), for example:
 
-```
-src/
-├── FrpBan.Protocol/          # Shared binary protocol library
-│   ├── Message.cs            # Bounded message framing (max 64 KiB body)
-│   ├── Messages/             # Individual wire message types
-│   ├── Transport/            # Exact asynchronous frame reads
-│   ├── Security/             # Shared TLS trust validation
-│   └── MessageType.cs        # Protocol message types
-├── FrpBan/                   # Server application
-│   ├── Services/
-│   │   ├── BanService.cs     # ConcurrentDictionary-based ban storage
-│   │   └── TcpServerService.cs  # TLS server + rate limiting
-│   ├── Endpoints/            # HTTP mapping and pre-body authorization
-│   ├── Security/             # Cached callback networks and bounded rate limits
-│   ├── Handlers/
-│   │   └── PluginRequestHandler.cs  # frps plugin handler
-│   └── Configuration/
-│       └── PluginSettings.cs
-└── FrpBan.Client/            # Client application
-    ├── Services/
-    │   ├── ClientConnectionService.cs  # Auto-reconnect TLS client
-    │   ├── BanDeliveryService.cs # Bounded retry queue for disconnected clients
-    │   ├── FileLogMonitor.cs  # Serialized, bounded UTF-8 log tailing
-    │   ├── RuleMatchEngine.cs # Regex pattern matching engine
-    │   └── RulesLoader.cs     # YAML rule configuration loader
-    └── rules.d/               # Ban rule definitions (YAML)
-
-tests/FrpBan.Tests/            # Unit, security and loopback integration tests
-Directory.Build.props         # Shared build properties
-Directory.Packages.props      # Central NuGet package versions
+```bash
+sudo apt install ./frp-ban-<version>-linux-x64.deb
 ```
 
----
+**2. Create a TLS certificate and configure the server**
 
-## Security Features
+```bash
+# Self-signed certificate (use your CA or Let's Encrypt in production)
+openssl req -x509 -newkey rsa:4096 -keyout server-key.pem -out server-cert.pem -days 365 -nodes \
+  -subj "/CN=frps.example.com" -addext "subjectAltName=DNS:frps.example.com"
+openssl pkcs12 -export -out server.pfx -inkey server-key.pem -in server-cert.pem
+sudo install -o root -g frp-ban -m 640 server.pfx /etc/frp-ban/certs/server.pfx
 
-### ✅ Implemented Protections
+# Keep secrets in the service environment file
+TOKEN="$(openssl rand -base64 32)"
+echo "PluginSettings__Token=$TOKEN" | sudo tee /etc/frp-ban/env >/dev/null
+echo "PluginSettings__Tls__CertificatePassword=<pfx-password>" | sudo tee -a /etc/frp-ban/env >/dev/null
+sudo chmod 600 /etc/frp-ban/env
 
-- **TLS rate limiting**: 10 new connections and 120 protocol messages/minute per IP (configurable)
-- **Connection pooling**: Max 100 concurrent TLS connections (configurable)
-- **Bounded input**: 64 KiB protocol/HTTP body limit, 64 Ki-character log-line limit
-- **TLS 1.2/1.3 only**: Disabled outdated protocols
-- **CIDR validation**: Validated prefix lengths (0-32 for IPv4, 0-128 for IPv6)
-- **Production TLS enforcement**: Cannot disable certificate validation in production
-- **Atomic persistence**: One coalescing writer and same-directory atomic file replacement; ban/unban requests wait for storage before reporting success
-- **IP exemptions**: Server-enforced IPv4/IPv6 and CIDR whitelist, including persisted bans
+sudo systemctl enable --now frp-ban
+```
 
----
+**3. Register the plugin in `frps.toml`** and restart frps:
+
+```toml
+[[httpPlugins]]
+name = "frp-ban"
+addr = "127.0.0.1:9000"
+path = "/handler"
+ops  = ["Login", "NewUserConn"]
+```
+
+**4. Install the client on each frpc host**
+
+```bash
+sudo apt install ./frp-ban-client-<version>-linux-x64.deb
+sudo nano /etc/frp-ban-client/appsettings.json   # ServerAddress and CaCertificatePath (copy server-cert.pem)
+echo "ClientSettings__Token=<same token as server>" | sudo tee /etc/frp-ban-client/env >/dev/null
+sudo chmod 600 /etc/frp-ban-client/env
+sudo usermod -aG adm frp-ban-client               # if monitored logs are owned by adm
+sudo systemctl enable --now frp-ban-client
+```
+
+**5. Verify**
+
+```bash
+journalctl -u frp-ban -f          # server: client connected, bans applied
+journalctl -u frp-ban-client -f   # client: rules loaded, connected to server
+```
+
+The bundled rules ban an IP for one hour after 5 failed SSH logins within 5 minutes.
+
+## Installation
+
+### Release packages
+
+Each [release](https://github.com/799953468/frp-ban/releases) provides the server (`frp-ban-…`) and client
+(`frp-ban-client-…`) separately for x64 and ARM64, with `SHA256SUMS`:
+
+| Platform            | Formats                                                          |
+|---------------------|------------------------------------------------------------------|
+| Linux (glibc)       | `.deb`, `.rpm`, Arch `.pkg.tar.zst`, portable `.tar.gz`          |
+| Alpine Linux (musl) | `.apk`, portable `.tar.gz`                                       |
+| Windows             | portable `.zip`                                                  |
+| macOS               | portable `.tar.gz`                                               |
+
+Every package includes the self-contained .NET runtime, configuration, license, and
+[release notes](packaging/RELEASE_NOTES.md). Server packages include `frps.toml.example`;
+client packages include `rules.d`.
+
+**Linux packages** create a dedicated service account, configuration in `/etc/frp-ban`
+or `/etc/frp-ban-client`, application files in `/opt`, a command launcher, and a
+systemd or OpenRC service. Secrets can be placed in `/etc/frp-ban/env` and
+`/etc/frp-ban-client/env`. Configuration and rules are preserved on upgrade.
+Services are **not** enabled or started automatically.
+
+**Portable archives** contain a versioned root folder with an `frp-ban[.cmd]` or
+`frp-ban-client[.cmd]` launcher and local data/log paths. Extract the whole archive
+and configure it before running the launcher. For a manual service installation, use
+the templates in [`packaging/linux/`](packaging/linux) and [`packaging/linux/client/`](packaging/linux/client).
+
+### Build from source
+
+Requires the [.NET 11 SDK](https://dotnet.microsoft.com/download).
+
+```bash
+git clone https://github.com/799953468/frp-ban.git
+cd frp-ban
+dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/server
+dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/client
+```
+
+Supported runtime identifiers: `linux-x64`, `linux-arm64`, `linux-musl-x64`,
+`linux-musl-arm64`, `win-x64`, `win-arm64`, `osx-x64`, `osx-arm64`. Any Linux host can
+publish every target; no native toolchain is required (Native AOT and ReadyToRun are
+not enabled). Without `-r`, the profile publishes for the local runtime into
+`publish/self-contained/<project>/<runtime>/`.
 
 ## Configuration
 
-### Server (`src/FrpBan/appsettings.json`)
+Both applications read `appsettings.json` from their working directory, then
+environment variables (`Section__Key=value`). The client also accepts command-line
+arguments (`--ClientSettings:ServerAddress=frps.example.com`). Use environment
+variables for secrets.
+
+### Server
+
+`appsettings.json` (installed at `/etc/frp-ban/appsettings.json`):
 
 ```json
 {
@@ -105,7 +207,7 @@ Directory.Packages.props      # Central NuGet package versions
     "Token": "CHANGE_ME_TO_A_LONG_RANDOM_SECRET",
     "BanFilePath": "/var/lib/frp-ban/bans.json",
     "AppLogPath": "/var/log/frp-ban/frp-ban-.log",
-    "AllowedPluginAddresses": ["127.0.0.1", "::1", "192.168.1.0/24"],
+    "AllowedPluginAddresses": ["127.0.0.1", "::1"],
     "ExemptAddresses": [],
     "DefaultBanDurationSeconds": 3600,
     "Tls": {
@@ -118,68 +220,62 @@ Directory.Packages.props      # Central NuGet package versions
       "RequireClientCertificate": false
     }
   },
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "Microsoft.AspNetCore": "Warning"
-    }
-  },
   "urls": "http://127.0.0.1:9000"
 }
 ```
 
-| Key | Description |
-|-----|-------------|
-| `Token` | TLS client authentication token (use env var `PluginSettings__Token` in production) |
-| `BanFilePath` | JSON file path for persistent ban storage; use a stable absolute path writable by the server account |
-| `AppLogPath` | Serilog log file path (auto-rotated) |
-| `AllowedPluginAddresses` | IPs/CIDR allowed to call `/handler` (frps localhost), empty = allow all; invalid entries or CIDRs with host bits set fail startup |
-| `ExemptAddresses` | IPs/CIDR exempt from bans, empty = no exemptions; restart the server after changes |
-| `DefaultBanDurationSeconds` | Default ban duration (seconds), `0` = permanent |
-| `WebUi.Enabled` | Enable the management page and API at `/admin/` (default: `false`) |
-| `WebUi.Token` | Separate management secret, 32–256 printable ASCII characters without spaces; must differ from `Token` |
-| `WebUi.AllowedAddresses` | Socket IPs/CIDRs allowed to access management (default: loopback); empty = any address with valid authentication |
-| `Tls.Enabled` | Enable TLS TCP listener |
-| `Tls.ListenAddress` | TLS listener address (default: `::`, dual-stack IPv6 + IPv4; falls back to `0.0.0.0` without IPv6). Use e.g. `10.0.0.1` to bind one interface |
-| `Tls.Port` | TLS listener port (default: 9443) |
-| `Logging.LogLevel.Default` | Minimum log level: Debug, Information, Warning, Error |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Token` | — | Shared secret for TLS clients. At least 32 characters; placeholders are rejected at startup. |
+| `BanFilePath` | `/var/lib/frp-ban/bans.json` | Persistent ban storage. Use a stable absolute path; the parent directory must be writable. |
+| `AppLogPath` | `/var/log/frp-ban/frp-ban-.log` | Log file (rotated daily). |
+| `AllowedPluginAddresses` | loopback | IPs/CIDRs allowed to call `/handler`. Empty = allow all. Invalid entries or CIDRs with host bits set fail startup. |
+| `ExemptAddresses` | `[]` | IPs/CIDRs that can never be banned. See [IP exemptions](#ip-exemptions). |
+| `DefaultBanDurationSeconds` | `3600` | Duration used when a request omits it. `0` = permanent. |
+| `MaxBanEntries` | `100000` | Maximum number of stored bans (1–1,000,000). |
+| `WebUi.*` | disabled | See [Web UI](#web-ui). |
+| `Tls.Enabled` | `true` | Enable TLS for the client listener. |
+| `Tls.ListenAddress` | `::` | Dual-stack by default; falls back to `0.0.0.0` without IPv6. Set e.g. `10.0.0.1` to bind one interface. |
+| `Tls.Port` | `9443` | TLS listener port. |
+| `Tls.CertificatePath` / `CertificatePassword` | — | PKCS#12 server certificate. |
+| `Tls.RequireClientCertificate` | `false` | Require mutual TLS. |
+| `Tls.MaxConcurrentConnections` | `100` | Concurrent TLS connections. |
+| `Tls.MaxConnectionsPerMinute` | `10` | New connections per IP per minute. |
+| `Tls.MaxMessagesPerMinute` | `120` | Protocol messages per IP per minute. |
+| `Tls.HandshakeTimeoutSeconds` | `10` | TLS + HELLO deadline. |
+| `Tls.IdleTimeoutSeconds` | `90` | Idle session timeout. |
+| `Tls.WriteTimeoutSeconds` | `10` | Write deadline. |
+| `urls` | `http://127.0.0.1:9000` | HTTP listener for frps callbacks and the Web UI. |
 
-**Ban persistence:**
-
-Ban records are saved automatically to `BanFilePath` (default: `/var/lib/frp-ban/bans.json`).
-Successful ban and unban responses mean the updated list has been written and atomically replaced on disk;
-no shutdown hook is required to save an acknowledged change. On startup, active bans are restored before
-the server accepts traffic. Permanent bans remain permanent, temporary bans retain their original expiry,
-and expired or exempt entries are not restored.
-
-Keep this file on persistent storage and retain the same path across restarts and upgrades. The server
-account needs write permission on its parent directory so it can create and replace the file. If writing
-fails, the management API returns HTTP 503 and the TLS client receives an unsuccessful ban response.
-Changes remain in memory for retry; another request retries pending changes, and the background writer
-also retries every 30 seconds. Invalid JSON prevents startup instead of silently resetting the ban list.
-
-**Production configuration:**
-```bash
-# Use environment variables for secrets
-export PluginSettings__Token="$(openssl rand -base64 32)"
-export PluginSettings__Tls__CertificatePassword="$(cat /etc/frp-ban/certs/password.txt)"
-```
-
-Startup rejects placeholder tokens and secrets shorter than 32 characters. HTTP
-callbacks bind to loopback by default; configure the listener and trusted callback
-addresses explicitly if frps runs on another host. Ban durations use `null` for
+The HTTP listener binds to loopback by default. If frps runs on another host, change
+`urls` and list the frps address in `AllowedPluginAddresses`. Durations use `null` for
 the configured default and `0` for a permanent ban.
 
-TLS deadlines and limits are configured under `PluginSettings.Tls`:
-`MaxConcurrentConnections` (100), `MaxConnectionsPerMinute` (10),
-`MaxMessagesPerMinute` (120), `HandshakeTimeoutSeconds` (10),
-`IdleTimeoutSeconds` (90), and `WriteTimeoutSeconds` (10).
+```bash
+# Production secrets (e.g. in /etc/frp-ban/env)
+PluginSettings__Token=...
+PluginSettings__Tls__CertificatePassword=...
+```
 
-### Web UI for ban management
+### IP exemptions
 
-The server includes a browser UI at `http://127.0.0.1:9000/admin/`. It is **disabled
-by default**. Enable it in `PluginSettings` and configure a separate management
-token before restarting the server:
+`PluginSettings.ExemptAddresses` protects trusted addresses from all ban requests:
+
+```json
+"ExemptAddresses": ["192.0.2.10", "198.51.100.0/24", "2001:db8::/32"]
+```
+
+- Accepts IPv4/IPv6 addresses and CIDRs. CIDRs must use the network address (`198.51.100.0/24`, not `198.51.100.10/24`). Hostnames and ports are rejected; invalid entries fail startup.
+- IPv4-mapped IPv6 matches the IPv4 equivalent (`::ffff:192.0.2.10` ≙ `192.0.2.10`). `0.0.0.0/0` covers IPv4 including mapped addresses; `::/0` covers native IPv6.
+- An empty list exempts nothing, not even loopback. The list is compiled at startup; restart after changes.
+- Exempt addresses are allowed at both `Login` and `NewUserConn`, cannot be banned, and do not consume capacity. Existing bans for them are dropped on startup and removed from the ban file; removing the exemption later does not restore them.
+- Exemptions do not bypass `AllowedPluginAddresses`, TLS authentication, or rate limits. No client configuration is needed.
+- Environment variables use indexed keys: `PluginSettings__ExemptAddresses__0=192.0.2.10`.
+
+### Web UI
+
+An optional management page is served at `http://127.0.0.1:9000/admin/`. It is
+**disabled by default** and uses its own token, which must differ from `Token`:
 
 ```json
 "WebUi": {
@@ -189,100 +285,63 @@ token before restarting the server:
 ```
 
 ```bash
-# Generate a separate secret once and keep it in your service's environment.
-# Do not reuse the token distributed to monitoring clients.
-export PluginSettings__WebUi__Token="$(openssl rand -hex 32)"
-# Alternatively, enable the UI through the environment too:
-export PluginSettings__WebUi__Enabled=true
+PluginSettings__WebUi__Token=$(openssl rand -hex 32)   # 32–256 printable ASCII characters, no spaces
 ```
 
-Set these variables in the environment of the **server process** (for an installed
-service, use its service configuration). Open `/admin/` and enter that management
-token. The UI keeps the token only in tab memory, never in cookies or browser
-storage. Reloading, leaving the page, or choosing **Lock session** clears it.
+- Search by IP or reason, filter temporary/permanent bans, and page through results.
+- Add IPv4/IPv6 bans with the default, a preset, a custom duration, or no expiry. Existing longer or permanent bans are kept.
+- Remove bans after confirmation. Rules may ban the address again on new activity.
+- The token is kept only in tab memory — never in cookies or storage. Reloading or **Lock session** clears it.
+- Assets are embedded in the server; no Node.js, separate frontend, or CDN is needed.
 
-- View active bans, search by IP or reason, filter temporary/permanent bans, and
-  page through results. Use **Refresh** to fetch changes and expired-ban removals.
-- Add IPv4/IPv6 bans with the server default, a preset, a custom duration in
-  seconds, or no expiry. Existing longer/permanent bans are preserved.
-- Remove a ban after confirmation. Monitoring rules can ban an address again if
-  new activity matches. Exempt addresses cannot be banned from the UI.
-- Changes take effect in the same in-memory store as TLS client requests and are
-  saved by the asynchronous persistence worker. A successful API response waits
-  for atomic ban-file replacement. Storage failures return HTTP `503`; the
-  in-memory change remains pending for retry, so fix storage and retry the request.
-- Assets are embedded in the server assembly. No Node.js,
-  separate frontend server, or external CDN is needed at runtime.
-
-For remote administration, keep the server on loopback and use an SSH tunnel:
+`WebUi.AllowedAddresses` (default: loopback) checks the socket peer. Empty allows any
+address with a valid token. For remote access, prefer an SSH tunnel:
 
 ```bash
 ssh -L 19000:127.0.0.1:9000 user@your-server
-# Then open http://127.0.0.1:19000/admin/ on your machine.
+# then open http://127.0.0.1:19000/admin/
 ```
 
-If exposing management through a reverse proxy, terminate HTTPS at the proxy,
-restrict direct access to the backend, and preserve the `/admin/` prefix.
-`WebUi.AllowedAddresses` checks the socket peer (the proxy address), not
-`X-Forwarded-For`; enforce end-user IP restrictions at the proxy. The TLS settings
-for port 9443 do **not** encrypt the HTTP listener. `/handler` keeps its separate
-`AllowedPluginAddresses` policy and does not accept management credentials as a
-substitute for callback address authorization.
+Behind a reverse proxy, terminate HTTPS at the proxy, restrict direct backend access,
+and keep the `/admin/` prefix. `AllowedAddresses` sees the proxy address, not
+`X-Forwarded-For`, so enforce end-user restrictions at the proxy. The port 9443 TLS
+settings do **not** apply to the HTTP listener. Restart after changing Web UI settings
+or rotating the token.
 
-The UI uses the following same-origin API. Every API request requires
-`Authorization: Bearer <management-token>`; query-string tokens are not accepted.
-Requests are limited to 120 per socket IP per minute, including failed
-authentication, and request bodies retain the server's 64 KiB limit.
+<details>
+<summary><b>Management API reference</b></summary>
 
-| Method | Route | Behavior |
-|--------|-------|----------|
-| `GET` | `/admin/api/bans` | `search` (up to 256 characters), `kind` (`all`, `temporary`, `permanent`), `page` (1-based), `pageSize` (1–100, default 25) |
-| `POST` | `/admin/api/bans` | JSON: `ip`, `reason` (1–1024 characters), optional `durationSeconds` (`null` = default, `0` = permanent) |
-| `DELETE` | `/admin/api/bans/{ip}` | Remove the URL-encoded IP; succeeds if the ban was already absent |
+All requests require `Authorization: Bearer <management-token>` (query-string tokens
+are not accepted). Limited to 120 requests per socket IP per minute, including failed
+authentication; bodies are limited to 64 KiB.
 
-The list response contains `items`, `total` (matching bans), `page`, `pageSize`,
-`activeCount`, `permanentCount`, and `defaultBanDurationSeconds`. Items use
-`ip`, `reason`, `bannedAt`, `expiresAt`, and `isActive`; times are ISO 8601.
-POST and DELETE return `204` on success. Validation errors return `400`, missing
-or invalid credentials `401`, disallowed addresses `403`, exempt/capacity
-conflicts `409`, oversized bodies `413`, unsupported content types `415`,
-rate limits `429` with `Retry-After: 60`, and persistence failures `503`.
-All management routes return `404` when disabled. Restart after changing
-management settings or rotating the token.
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/admin/api/bans` | Query: `search` (≤ 256 chars), `kind` (`all`, `temporary`, `permanent`), `page` (1-based), `pageSize` (1–100, default 25) |
+| `POST` | `/admin/api/bans` | JSON: `ip`, `reason` (1–1024 chars), optional `durationSeconds` (`null` = default, `0` = permanent) |
+| `DELETE` | `/admin/api/bans/{ip}` | Remove the URL-encoded IP; succeeds if already absent |
 
-### IP whitelist / exemption list
+The list response contains `items`, `total`, `page`, `pageSize`, `activeCount`,
+`permanentCount`, and `defaultBanDurationSeconds`. Items contain `ip`, `reason`,
+`bannedAt`, `expiresAt`, and `isActive` (ISO 8601 times).
 
-Set `PluginSettings.ExemptAddresses` on the server to protect trusted addresses
-from all client ban requests. For example:
+| Status | Meaning |
+|--------|---------|
+| `204` | POST/DELETE succeeded (change persisted) |
+| `400` | Validation error |
+| `401` | Missing or invalid token |
+| `403` | Address not allowed |
+| `404` | Web UI disabled |
+| `409` | Exempt address or capacity reached |
+| `413` / `415` | Body too large / unsupported content type |
+| `429` | Rate limited (`Retry-After: 60`) |
+| `503` | Persistence failed; change stays pending in memory — fix storage and retry |
 
-```json
-"ExemptAddresses": ["192.0.2.10", "198.51.100.0/24", "2001:db8::/32"]
-```
+</details>
 
-- Supports individual IPv4/IPv6 addresses and CIDR networks. CIDRs must use the
-  network address (for example, `198.51.100.0/24`, not `198.51.100.10/24`). Invalid
-  entries fail startup. Hostnames and addresses with ports are not accepted.
-- IPv4-mapped IPv6 addresses match their IPv4 equivalents. For example,
-  `::ffff:192.0.2.10` matches `192.0.2.10`, and `::ffff:198.51.100.0/120` matches
-  the IPv4 network `198.51.100.0/24`. `0.0.0.0/0` covers IPv4 (including mapped
-  addresses); `::/0` covers native IPv6.
-- An empty list exempts no addresses, including loopback. Changes require a
-  server restart; the list is compiled once at startup.
-- Exempt addresses cannot receive temporary or permanent bans and do not consume
-  ban capacity. Existing active bans for these addresses are skipped on startup
-  and removed from the persisted file after it passes validation. Once that
-  cleanup is persisted, removing an exemption does not restore the old ban.
-- Both `Login` and `NewUserConn` callbacks allow exempt addresses. TLS ban
-  requests return `Success: false` with an explicit exemption message, and the
-  client continues processing later queued requests.
-- `AllowedPluginAddresses` separately controls who can call `/handler`.
-  Exemptions do not bypass callback access checks, TLS authentication, or rate
-  limits, and require no client-side configuration.
+### Client
 
-Environment variables can also set indexed entries, for example
-`PluginSettings__ExemptAddresses__0=192.0.2.10`.
-
-### Client (`src/FrpBan.Client/appsettings.json`)
+`appsettings.json` (installed at `/etc/frp-ban-client/appsettings.json`):
 
 ```json
 {
@@ -290,7 +349,7 @@ Environment variables can also set indexed entries, for example
     "ServerAddress": "frps.example.com",
     "ServerPort": 9443,
     "Token": "CHANGE_ME_TO_A_LONG_RANDOM_SECRET",
-    "RulesPath": "./rules.d",
+    "RulesPath": "rules.d",
     "Tls": {
       "ValidateServerCertificate": true,
       "AllowSelfSignedCertificates": false,
@@ -309,78 +368,69 @@ Environment variables can also set indexed entries, for example
 }
 ```
 
-TLS is always used; the former `Tls.Enabled` key is no longer read.
-Client certificates are optional unless the server requires mTLS. Configure
-`CaCertificatePath` for a private CA; otherwise system trust is used.
-Log monitors start immediately, even while the server is unreachable, so attacks
-detected during an outage are queued and delivered after the client connects.
-The client reads `appsettings.json` from its working directory, then environment
-variables (`ClientSettings__Token=...`) and command-line arguments
-(`--ClientSettings:ServerAddress=frps.example.com`). Invalid settings, or rule
-sources with no valid enabled rule, stop the client with exit code 1.
-`ConnectionTimeoutSeconds` defaults to 15, `RequestTimeoutSeconds` to 10, and
-`MaxPendingBans` to 1024. Queued bans retry after reconnection and remain in memory
-only; normal process shutdown drains tasks but does not persist this client queue.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ServerAddress` / `ServerPort` | — / `9443` | frp-ban TLS listener. |
+| `Token` | — | Must match the server `Token`. |
+| `RulesPath` | `rules.d` | Directory of YAML rule files, relative to the working directory. |
+| `Tls.CaCertificatePath` | system trust | CA (or self-signed certificate) used to validate the server. |
+| `Tls.ClientCertificatePath` | — | Client certificate, required only if the server enables mTLS. |
+| `Tls.ValidateServerCertificate` | `true` | Cannot be disabled in production. |
+| `Reconnection.*` | see above | Exponential backoff; `MaxRetries: -1` = retry forever. |
+| `ConnectionTimeoutSeconds` | `15` | Connect + handshake timeout. |
+| `RequestTimeoutSeconds` | `10` | Ban request timeout. |
+| `MaxPendingBans` | `1024` | In-memory queue size while disconnected. |
 
-### Ban Rules (`src/FrpBan.Client/rules.d/*.yaml`)
+TLS is always used. Log monitors start immediately, even if the server is unreachable;
+detected attacks are queued and delivered after reconnecting. The queue is in memory
+only and is not persisted across restarts. Invalid settings, or rule sources with no
+valid enabled rule, stop the client with exit code 1.
 
-Example: `01-ssh-bruteforce.yaml`
+### Ban rules
+
+Rules live in `rules.d/*.yaml`. Example (`01-ssh-bruteforce.yaml`, simplified):
+
 ```yaml
 rules:
   - name: ssh-bruteforce
     enabled: true
     logSource:
-      type: file
+      type: file                 # file | journal
       path: /var/log/auth.log
     matching:
       - type: regex
-        pattern: |-
-          (?x)\A
-          (?:
-            (?:
-              [A-Z][a-z]{2}[ ]+[0-9]{1,2}[ ][0-9]{2}:[0-9]{2}:[0-9]{2}
-              |
-              [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}
-              (?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})
-            )[ ]\S+[ ]
-          )?
-          sshd(?:-session|-auth)?(?:\[[0-9]+\])?:[ ]
-          Failed[ ]password[ ]for[ ][^\r\n]*[ ]from[ ]
-          (?<ip>\S+)[ ]port[ ][0-9]+[ ]ssh2(?:[ ]\[preauth\])?\z
+        pattern: 'sshd(?:-session|-auth)?(?:\[[0-9]+\])?: Failed password for [^\r\n]* from (?<ip>\S+) port [0-9]+ ssh2'
     action:
       type: threshold
-      maxMatches: 5
-      windowSeconds: 300
-      banDurationSeconds: 3600
+      maxMatches: 5              # ban after 5 matches...
+      windowSeconds: 300         # ...within 5 minutes
+      banDurationSeconds: 3600   # 0 = permanent
       reason: SSH brute force attempt
     maxTrackedIps: 10000
 ```
 
-The bundled SSH rules accept plain `sshd` messages or syslog lines with a hostname
-and an RFC 3164 or RFC 3339 timestamp. They validate the program prefix and match
-the complete connection suffix, supporting IPv4 and IPv6 without treating IP text
-inside a username as the source address. Preserve these boundaries when adapting
-rules to another log format. Existing installations must update their installed
-`rules.d` files and restart the client to use the corrected rules.
+| Option | Description |
+|--------|-------------|
+| `logSource.type: file` | Tail a file using an event-driven watcher (no polling). |
+| `logSource.type: journal` | Follow a systemd unit (Linux only). See below. |
+| `matching[].type: regex` | .NET regex; the named group `ip` captures the source address. Cached, 100 ms timeout. |
+| `matching[].type: json` | Match JSON log lines with `jsonPath`, `jsonValue`, and `ipJsonPath`. |
+| `action.type: threshold` | Ban after `maxMatches` within `windowSeconds`. |
+| `maxTrackedIps` | Upper bound on IPs tracked per rule. |
 
-Repeated ban requests can only extend an existing expiry or make it permanent.
-A shorter request preserves the stronger ban, including its reason and timestamp;
-a permanent ban must be explicitly removed before a temporary ban can replace it.
+The bundled rules (`01-ssh-bruteforce.yaml`, `02-ssh-invalid-user.yaml`) use stricter,
+anchored expressions that accept plain `sshd` messages or syslog lines with RFC 3164 or
+RFC 3339 timestamps, support IPv4 and IPv6, and never treat IP text inside a username
+as the source address. Keep these boundaries when adapting rules to other formats.
 
-**Rule options:**
-- `type: file` — Monitor file with FileSystemWatcher (efficient, no polling)
-- `type: journal` — Follow new systemd journal messages for the required `service` unit (Linux only)
-- `action.type: threshold` — Trigger after `maxMatches` in `windowSeconds`
-- `banDurationSeconds: 0` — Permanent ban
+Repeated ban requests can only extend an existing ban or make it permanent; a shorter
+request keeps the stronger ban, including its reason and timestamp. A permanent ban
+must be removed explicitly before a temporary one can replace it.
 
 ### Systemd journal rules
 
-On Linux hosts using systemd, set `logSource.type` to `journal` and specify the
-system unit in `logSource.service`. The client requires `journalctl` on its `PATH`
-and permission to read that unit's journal. No log file or rsyslog setup is needed.
-
-For example, replace the file-based SSH brute-force rule with this journal rule
-(use `sshd.service` instead of `ssh.service` if that is your distribution's unit):
+On systemd hosts, rules can follow a unit's journal instead of a log file. This
+requires `journalctl` on `PATH` and read access to the unit's journal:
 
 ```yaml
 rules:
@@ -388,7 +438,7 @@ rules:
     enabled: true
     logSource:
       type: journal
-      service: ssh.service
+      service: ssh.service       # or sshd.service, depending on the distribution
     matching:
       - type: regex
         pattern: '\AFailed password for [^\r\n]* from (?<ip>\S+) port [0-9]+ ssh2(?: \[preauth\])?\z'
@@ -400,337 +450,198 @@ rules:
       reason: SSH brute force attempt
 ```
 
-Journal rules match the message body (`MESSAGE`) only, without timestamps,
-hostnames, or an `sshd[pid]:` prefix. Adapt file-based expressions accordingly;
-changing only `type` and `service` in a bundled SSH rule is insufficient. For
-applications that log JSON messages, the existing `type: json`, `jsonPath`,
-`jsonValue`, and `ipJsonPath` options operate on that JSON body, not journal metadata.
-Multiline messages are evaluated one line at a time. Matching and threshold
-counting use the same engine as file monitoring.
-
-The monitor follows new messages only (`journalctl --system --follow --lines=0
---output=cat --no-pager --unit=ssh.service`). Existing entries are not replayed at
-startup or after a client restart, and no journal cursor is persisted. Lines over
-64 Ki characters are discarded. Cancellation terminates and reaps the child
-process. An unexpected `journalctl` exit fails the client so a service supervisor
-can restart it; the supplied systemd template uses `Restart=on-failure`.
-
-Grant the service account journal access and verify it before starting the client:
-
 ```bash
 sudo usermod -aG systemd-journal frp-ban-client
 sudo -u frp-ban-client journalctl --system --unit=ssh.service --lines=5 --output=cat --no-pager
 sudo systemctl restart frp-ban-client
 ```
 
-Journal group names and ACLs can vary by distribution. Check that the command
-above can read the intended unit. Missing `journalctl`, unsupported platforms,
-and process failures are reported as errors; journal diagnostics are logged as
-warnings. File monitoring remains available on Windows, macOS, and Linux hosts
-without systemd.
+- Journal rules match only the message body (`MESSAGE`) — no timestamp, hostname, or `sshd[pid]:` prefix. Changing `type` and `service` on a file rule is not enough; adapt the expression.
+- JSON options (`type: json`) apply to the JSON message body, not journal metadata. Multiline messages are matched one line at a time.
+- Only new messages are followed (`journalctl --follow --lines=0`); existing entries are not replayed and no cursor is stored.
+- Lines over 64 Ki characters are discarded. If `journalctl` exits unexpectedly, the client fails so the service manager can restart it (`Restart=on-failure`).
 
----
+## Operations
 
-## Build & Run
+### Ban persistence
 
-### Release packages
+Bans are written to `BanFilePath` by a single coalescing writer using atomic
+same-directory replacement. A successful ban/unban response means the change is on
+disk. On startup, active bans are restored before traffic is accepted; temporary bans
+keep their original expiry, and expired or exempt entries are dropped.
 
-Releases retain the v1.1.0 package formats and layout: 32 installers and portable
-archives plus `SHA256SUMS`. Server (`frp-ban-…`) and client (`frp-ban-client-…`)
-are packaged separately for x64 and ARM64.
+If a write fails, the Web UI API returns `503` and TLS clients receive
+`StorageUnavailable`. The change stays in memory and is retried by the next request
+and every 30 seconds. An invalid JSON file prevents startup instead of silently
+resetting the ban list.
 
-| Platform | Formats |
-| --- | --- |
-| Windows | Portable `.zip` |
-| macOS | Portable `.tar.gz` |
-| Linux (glibc) | Portable `.tar.gz`, Debian `.deb`, RPM `.rpm`, Arch `.pkg.tar.zst` |
-| Alpine Linux (musl) | Portable `.tar.gz`, `.apk` |
+### Logging
 
-Every package includes the complete self-contained .NET runtime, configuration,
-license, and release notes. Server packages include `frps.toml.example`; client
-packages include `rules.d`. Portable archives retain their versioned root folder
-and `frp-ban[.cmd]` or `frp-ban-client[.cmd]` launcher, with local data/log paths.
-Extract the entire archive and configure it before using the launcher.
-
-Linux installers retain the dedicated service accounts, `/etc/frp-ban` and
-`/etc/frp-ban-client` configuration, `/opt` application files, command launchers,
-and systemd/OpenRC services. Existing configuration and client rules are preserved
-on package upgrades. Services are not enabled or started automatically.
-See [release notes](packaging/RELEASE_NOTES.md) for software changes and
-[Deployment](#deployment) for service setup.
-
-### Build
+| | |
+|---|---|
+| Path | `PluginSettings.AppLogPath` (default `/var/log/frp-ban/frp-ban-.log`) |
+| Rotation | Daily, plus a 100 MB size limit |
+| Retention | 30 days |
+| Format | `YYYY-MM-DD HH:mm:ss.fff [LEVEL] Message` |
+| Level | `Logging.LogLevel.Default` (`Debug`, `Information`, `Warning`, `Error`) |
 
 ```bash
-# Build all projects
-dotnet build FrpBan.slnx
-
-# Publish server (self-contained)
-dotnet publish src/FrpBan -c Release -r linux-x64 --self-contained -o ./publish/server
-
-# Publish client
-dotnet publish src/FrpBan.Client -c Release -r linux-x64 --self-contained -o ./publish/client
-```
-
-### Development
-
-```bash
-# Run server
-cd src/FrpBan
-dotnet run
-
-# Run client
-cd src/FrpBan.Client
-dotnet run
-```
-
-### Generate TLS Certificates
-
-```bash
-# Self-signed certificate for development
-openssl req -x509 -newkey rsa:4096 -keyout server-key.pem -out server-cert.pem -days 365 -nodes \
-  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-openssl pkcs12 -export -out server.pfx -inkey server-key.pem -in server-cert.pem
-
-# Set ClientSettings.Tls.CaCertificatePath to server-cert.pem for this local certificate.
-# For production, use Let's Encrypt or your organization's CA
-```
-
----
-
-## Deployment
-
-### Self-contained publishing
-
-Publish with the .NET 11 SDK. The output includes the target platform's .NET
-runtime and uses ordinary managed execution; Native AOT and ReadyToRun are not
-enabled. No target-specific C++ compiler is required:
-
-```bash
-dotnet publish src/FrpBan/FrpBan.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/server
-dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -r linux-x64 -p:PublishProfile=SelfContained -o publish/client
-```
-
-Replace `linux-x64` with `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`,
-`win-x64`, `win-arm64`, `osx-x64`, or `osx-arm64`. The Linux build host can
-publish every target; execution still requires the matching OS and architecture.
-Linux deployments need the native OS libraries required by .NET 11.
-
-Both projects include a `Properties/PublishProfiles/SelfContained.pubxml` profile for
-Rider folder publishing. It defaults to the local SDK's runtime identifier and
-publishes into `publish/self-contained/<project>/<runtime>/`. The same profile works from the CLI:
-
-```bash
-dotnet publish src/FrpBan/FrpBan.csproj -c Release -p:PublishProfile=SelfContained
-dotnet publish src/FrpBan.Client/FrpBan.Client.csproj -c Release -p:PublishProfile=SelfContained
-```
-
-GitHub and GitLab independently build both components for all eight targets on
-Linux. GitLab uses the existing Docker runner tagged `server`; no Windows,
-macOS, ARM64, or privileged Docker-in-Docker runner is required. Tag a commit
-as `vX.Y.Z` and push that same tag to both remotes to start both release pipelines.
-
-Both CI providers use the same `scripts/release.py` packaging flow as v1.1.0:
-self-contained publishing, portable launchers and configuration, and nFPM Linux
-installers. The script verifies all 32 packages before writing `SHA256SUMS`.
-GitLab CI uploads its own packages to the project's generic package registry
-using `CI_JOB_TOKEN`, then creates the release with the English notes in
-`packaging/RELEASE_NOTES.md`.
-
-### Server (systemd)
-
-Install the server package for your distribution to provision its service
-account, `/etc/frp-ban` configuration, `/opt/frp-ban` files, and service unit.
-Configure the token and TLS certificate before enabling the service.
-
-For a manual portable-archive installation, extract into `/opt/frp-ban`, then provision the service account,
-configuration and data directories yourself. The service and launcher templates
-are in `packaging/linux/`. Configure the token and TLS certificate before starting
-the service. Archives do not install or enable a system service automatically.
-
-```bash
-sudo nano /etc/frp-ban/appsettings.json
-# Configure Token and Tls.CertificatePath, or set secrets in /etc/frp-ban/env.
-sudo systemctl enable --now frp-ban
-sudo systemctl status frp-ban
-journalctl -u frp-ban -f
-```
-
-### Client (systemd)
-
-Install the client package for your distribution to provision its service
-account, `/etc/frp-ban-client` configuration and rules, and service unit.
-Configure the connection and log permissions before enabling the service.
-
-For a manual portable-archive installation, extract into `/opt/frp-ban-client`, then provision its service
-account and directories using the templates in `packaging/linux/client/`.
-Configure the server address, token and TLS trust, edit the bundled rules, and
-grant the `frp-ban-client` account read access to monitored logs.
-
-```bash
-# After installing and configuring the service manually:
-sudo nano /etc/frp-ban-client/appsettings.json
-sudo nano /etc/frp-ban-client/rules.d/01-ssh-bruteforce.yaml
-# If monitored logs are owned by adm, grant access before starting:
-# sudo usermod -aG adm frp-ban-client
-sudo systemctl enable --now frp-ban-client
-sudo systemctl status frp-ban-client
-journalctl -u frp-ban-client -f
-```
-
----
-
-## frps Configuration
-
-Add to `frps.toml`:
-
-```toml
-[[httpPlugins]]
-name = "frp-ban"
-addr = "127.0.0.1:9000"
-path = "/handler"
-ops  = ["Login", "NewUserConn"]
-```
-
----
-
-## Logging
-
-### Application Logs
-
-- **Path**: `PluginSettings.AppLogPath` (default: `/var/log/frp-ban/frp-ban-.log`)
-- **Rotation**: Daily + 100MB file size limit
-- **Retention**: 30 days
-- **Format**: `YYYY-MM-DD HH:mm:ss.fff [LEVEL] Message`
-
-```bash
-# Real-time (systemd)
 sudo journalctl -u frp-ban -f
-
-# Real-time (log file)
 sudo tail -f /var/log/frp-ban/frp-ban-$(date +%Y%m%d).log
-
-# Search errors
 sudo grep -i error /var/log/frp-ban/frp-ban-*.log
 ```
 
----
+## Security
 
-## Performance Characteristics
+- **Transport**: TLS 1.2/1.3 only; optional mutual TLS. Certificate validation cannot be disabled in production.
+- **Authentication**: Clients authenticate with a token hash in `HELLO`; tokens shorter than 32 characters or left as placeholders are rejected at startup. The Web UI uses a separate token.
+- **Access control**: `/handler` is limited to `AllowedPluginAddresses`; the Web UI to `WebUi.AllowedAddresses`. Both default to loopback.
+- **Resource limits**: 100 concurrent TLS connections, 10 new connections and 120 messages per IP per minute, 64 KiB protocol/HTTP bodies, 64 Ki-character log lines, handshake/idle/write deadlines — all configurable.
+- **Input validation**: Strict IP and CIDR parsing (prefix 0–32 for IPv4, 0–128 for IPv6).
 
-| Metric | Value |
-|--------|-------|
-| Ban lookup (IsBanned) | ConcurrentDictionary lookup with canonical IP keys |
-| Max concurrent TLS connections | 100 (configurable) |
-| TLS connection rate | 10 new connections/minute per IP (configurable) |
-| Protocol message rate | 120 messages/minute per IP (configurable) |
-| Max protocol/HTTP body | 64 KiB |
-| Frame buffers | Pooled on demand; no fixed 1 MiB receive buffer |
-| File monitoring | Event-driven, serialized reads with bounded partial-line state |
-| Regex matching | Cached per expression, 100 ms timeout |
-| Persistence | One writer, approximately 100 ms burst coalescing, atomic replace |
+**Reporting vulnerabilities**: please report security issues privately to the
+maintainer instead of opening a public issue.
 
-These describe implementation limits, not benchmark results. Production latency,
-throughput, and memory usage depend on workload and require measurement.
+## Protocol
 
----
-
-## Troubleshooting
-
-### Client cannot connect
-
-1. Check TLS certificate:
-   ```bash
-   openssl s_client -connect frps.example.com:9443 -showcerts
-   ```
-
-2. Check token hash:
-   ```bash
-   echo -n "your-token" | sha256sum
-   ```
-
-3. View server logs:
-   ```bash
-   journalctl -u frp-ban -n 50
-   ```
-
-### High memory usage
-
-- Check ban count: inspect `/var/lib/frp-ban/bans.json`
-- Review ban expiration settings
-- Monitor for ban list pollution
-
-### TLS connection failures
-
-- Ensure `ValidateServerCertificate` matches environment (disable only in development)
-- Check certificate expiration: `openssl x509 -in server-cert.pem -noout -dates`
-- Configure CA certificate path for self-signed certificates
-
----
-
-## Protocol Specification
-
-### Binary Message Format
+Clients and server communicate over TLS using length-prefixed frames:
 
 ```
-[Type: 1 byte][Length: 4 bytes big-endian][Body: variable]
+[Type: 1 byte][Length: 4 bytes, big-endian][Body: UTF-8 JSON, ≤ 64 KiB]
 ```
 
-**Message Types:**
-- `0x01` HELLO — Handshake (includes token hash)
-- `0x02` BAN_REQUEST — Ban request
-- `0x03` BAN_RESPONSE — Ban response
-- `0x04` PING — Health check
-- `0x05` PONG — Health check response
-- `0x06` ERROR — Error message
+| Type | Name | Direction | Purpose |
+|------|------|-----------|---------|
+| `0x01` | `HELLO` | client → server | Handshake with protocol version and token hash |
+| `0x02` | `BAN_REQUEST` | client → server | Request a ban |
+| `0x03` | `BAN_RESPONSE` | server → client | Result of a ban request |
+| `0x04` | `PING` | client → server | Health check |
+| `0x05` | `PONG` | server → client | Health check reply |
+| `0x06` | `ERROR` | server → client | Error message |
 
-**Body Format**: JSON (UTF-8). Unknown message types and oversized frames close the session.
+Unknown message types and oversized frames close the session. The current protocol
+version is **2.0**; the server rejects any other version, so upgrade clients and
+server together when moving from 1.x.
 
-**Version**: HELLO carries protocol version `2.0`; the server rejects any other version.
-Version 2.0 is not compatible with 1.x clients, so upgrade clients and server together.
-
-**BAN_RESPONSE** carries `{"Status": "...", "Message": "..."}`:
+`BAN_RESPONSE` carries `{"Status": "...", "Message": "..."}`:
 
 | Status | Meaning | Client action |
 |--------|---------|---------------|
 | `Applied` | Ban added or extended and persisted | Done |
-| `AlreadyBanned` | An equal or stronger ban already exists and is persisted | Done |
+| `AlreadyBanned` | An equal or stronger ban already exists | Done |
 | `Exempt` | Address is in `ExemptAddresses` | Drop |
-| `Invalid` | Invalid IP, reason (1–1024 characters), or negative duration | Drop |
+| `Invalid` | Invalid IP, reason (1–1024 chars), or negative duration | Drop |
 | `CapacityReached` | `MaxBanEntries` reached | Drop |
-| `StorageUnavailable` | Ban is active in memory but not yet persisted | Retry later |
+| `StorageUnavailable` | Active in memory but not yet persisted | Retry later |
 
----
+## Troubleshooting
 
-## License
+<details>
+<summary><b>Client cannot connect</b></summary>
 
-MIT License
+```bash
+openssl s_client -connect frps.example.com:9443 -showcerts   # check certificate and reachability
+journalctl -u frp-ban -n 50                                   # check server-side errors
+journalctl -u frp-ban-client -n 50
+```
 
----
+- Make sure client and server use the same `Token` and the same protocol version.
+- Check that port 9443 is open and `Tls.ListenAddress` covers the right interface.
+</details>
 
-## Contributing
+<details>
+<summary><b>TLS certificate errors</b></summary>
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+- For a self-signed or private-CA certificate, set `ClientSettings.Tls.CaCertificatePath`.
+- The certificate's subject alternative name must match `ServerAddress`.
+- Check expiry: `openssl x509 -in server-cert.pem -noout -dates`.
+</details>
 
-**Security vulnerabilities**: Please report privately to the maintainer.
+<details>
+<summary><b>Bans are not triggered</b></summary>
 
----
+- Confirm the client account can read the log file or journal unit.
+- Test the rule regex against a real log line; journal rules see only the message body.
+- Check that the attacker IP is not listed in `ExemptAddresses`.
+</details>
+
+<details>
+<summary><b>High memory usage</b></summary>
+
+- Inspect the ban count in `/var/lib/frp-ban/bans.json`.
+- Review ban durations and `MaxBanEntries`; look for rules that match too broadly.
+</details>
+
+## Development
+
+```bash
+dotnet build FrpBan.slnx
+dotnet test FrpBan.slnx
+python3 -m unittest discover -s scripts/tests -v   # release packaging tests
+
+# Run locally
+dotnet run --project src/FrpBan
+dotnet run --project src/FrpBan.Client
+```
+
+<details>
+<summary><b>Project structure</b></summary>
+
+```
+src/
+├── FrpBan.Protocol/   # Shared wire protocol: framing, messages, transport, TLS trust
+├── FrpBan/            # Server: frps plugin endpoint, TLS listener, ban store, Web UI
+│   ├── Endpoints/     #   HTTP routes and pre-body authorization
+│   ├── Handlers/      #   frps plugin request handling
+│   ├── Security/      #   address lists and rate limiting
+│   ├── Services/      #   BanService, TcpServerService
+│   └── WebUi/         #   embedded management page
+└── FrpBan.Client/     # Client: log monitors, rule engine, TLS connection, retry queue
+    ├── Services/
+    └── rules.d/       #   bundled YAML rules
+tests/FrpBan.Tests/    # Unit, security and loopback integration tests
+packaging/             # Linux service templates, install scripts, release notes
+scripts/release.py     # Release packaging (shared by GitHub and GitLab CI)
+```
+</details>
+
+<details>
+<summary><b>Releasing</b></summary>
+
+GitHub Actions and GitLab CI each build both components for all eight targets on
+Linux using `scripts/release.py`, which publishes self-contained builds, creates
+portable archives and nFPM Linux packages, verifies all 32 assets, and writes
+`SHA256SUMS`. To release, tag a commit as `vX.Y.Z` and push the tag to both remotes.
+GitLab uploads assets to the project's generic package registry and uses
+[`packaging/RELEASE_NOTES.md`](packaging/RELEASE_NOTES.md) for the release notes.
+</details>
 
 ## Roadmap
 
-- [x] Systemd journal monitoring support (`type: journal`)
-- [x] IP whitelist/exemption list
-- [ ] Prometheus metrics endpoint
+- [x] Systemd journal monitoring
+- [x] IP exemption list
 - [x] Web UI for ban management
+- [ ] Prometheus metrics endpoint
 - [ ] Docker/Podman images
 - [ ] Kubernetes Helm chart
-- [ ] Full IPv6 testing
-- [ ] gRPC protocol option (alternative to binary TCP)
+- [ ] Full IPv6 test coverage
+- [ ] gRPC protocol option
 
----
+## Contributing
 
-See [CHANGELOG.md](CHANGELOG.md) for version history.
+Contributions are welcome!
+
+1. Fork the repository and create a branch: `git checkout -b feature/my-feature`
+2. Make your changes and add tests where appropriate.
+3. Run `dotnet test FrpBan.slnx` and make sure everything passes.
+4. Commit using [Conventional Commits](https://www.conventionalcommits.org/) (e.g. `feat(client): ...`, `fix: ...`).
+5. Open a pull request and describe the change. Update [CHANGELOG.md](CHANGELOG.md) for user-visible changes.
+
+## License
+
+Distributed under the [MIT License](LICENSE).
+
+## Acknowledgements
+
+- [frp](https://github.com/fatedier/frp) — the fast reverse proxy this project extends.
+- [fail2ban](https://github.com/fail2ban/fail2ban) — inspiration for log-based banning.
