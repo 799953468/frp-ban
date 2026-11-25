@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-25
+
 ### Breaking
 
 - Protocol version 2.0: `BAN_RESPONSE` replaces `Success` with a `Status` (`Applied`, `AlreadyBanned`, `Exempt`, `Invalid`, `CapacityReached`, `StorageUnavailable`). 1.x clients are rejected at HELLO; upgrade clients and server together.
-- `AllowedPluginAddresses` is now validated like `ExemptAddresses`: invalid entries and CIDRs with host bits set (for example `10.0.0.1/8`) fail startup with the setting name in the error.
+- `AllowedPluginAddresses` and `WebUi.AllowedAddresses` are now validated like `ExemptAddresses`: invalid entries and CIDRs with host bits set (for example `10.0.0.1/8`) fail startup with the setting name in the error.
 - Rule integers with a leading zero are decimal: `windowSeconds: 0600` now means 600 seconds, not octal 384.
 - The client no longer reads `ClientSettings.Tls.Enabled`; TLS is always on.
 
@@ -155,7 +157,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auto-reconnect TLS client with exponential backoff
 - Health check (ping/pong) protocol
 
-[Unreleased]: https://github.com/799953468/frp-ban/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/799953468/frp-ban/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/799953468/frp-ban/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/799953468/frp-ban/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/799953468/frp-ban/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/799953468/frp-ban/releases/tag/v1.0.0

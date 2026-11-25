@@ -1,41 +1,67 @@
-# v1.2.0
+# v2.0.0
+
+v2.0.0 introduces protocol 2.0 and makes the client more reliable when the
+server is unreachable. **This is a breaking release: upgrade the server and all
+clients together.**
+
+## Breaking Changes
+
+- **Protocol 2.0:** `BAN_RESPONSE` now carries a `Status` instead of `Success`:
+  `Applied`, `AlreadyBanned`, `Exempt`, `Invalid`, `CapacityReached` or
+  `StorageUnavailable`. A 2.0 server rejects 1.x clients at `HELLO`, and a 2.0
+  client cannot talk to a 1.x server.
+- **Stricter address lists:** `AllowedPluginAddresses` and
+  `WebUi.AllowedAddresses` are validated like
+  `ExemptAddresses`. Invalid entries and CIDRs with host bits set (for example
+  `10.0.0.1/8`; use `10.0.0.0/8`) now fail startup, and the error names the
+  setting.
+- **Decimal rule integers:** Rule integers with a leading zero are decimal.
+  `windowSeconds: 0600` now means 600 seconds instead of octal 384.
+- **Client TLS is always on:** `ClientSettings.Tls.Enabled` is no longer read
+  and can be removed from client configuration.
 
 ## New Features
 
-- **Ban-management Web UI:** View and search active bans, filter temporary and
-  permanent entries, add bans with custom durations, and remove bans after
-  confirmation at `/admin/`.
-- **IP whitelist:** Protect trusted IPv4/IPv6 addresses and CIDR networks with
-  `PluginSettings.ExemptAddresses`. Exempt addresses cannot be banned, and their
-  existing bans are removed from validated storage when the server starts.
-- **Systemd journal monitoring:** Linux clients can monitor a systemd unit with
-  `logSource.type: journal` and `logSource.service`, using the same matching and
-  threshold rules as file monitoring.
+- **IPv6 TLS listener:** The new `PluginSettings.Tls.ListenAddress` setting
+  controls the server TLS listener address. The default `::` accepts both IPv6
+  and IPv4 clients; previously the listener accepted IPv4 only.
+- **Command-line configuration:** The client now runs on the .NET Generic Host
+  and accepts configuration overrides as command-line arguments, for example
+  `--ClientSettings:ServerAddress=frps.example.com`.
 
 ## Fixes
 
-- Wait for ban-file persistence before confirming successful ban or unban
-  requests, including duplicate requests. Report storage failures and retain
-  pending changes for retry.
-- Preserve ban expiry times across restarts, retain concurrent updates during
-  persistence, and flush pending writes during shutdown.
-- Prevent shorter bans from weakening longer or permanent bans. Prevent expiry
-  cleanup from removing a ban that was refreshed concurrently.
-- Harden bundled SSH patterns against misleading username text and unrelated
-  messages. Support traditional and ISO timestamps, plus `sshd-session` and
-  `sshd-auth` process names.
+- Log monitors start immediately instead of waiting for the first successful
+  connection, so attack lines written while the server is unreachable are
+  queued instead of skipped.
+- A ban that the server applied but could not persist (`StorageUnavailable`) is
+  retried by the client instead of being dropped as rejected.
+- An unauthenticated peer that sends an unknown frame type no longer produces
+  an Error log entry.
+- A management request received during shutdown no longer reports "Ban
+  capacity reached".
 
-## Configuration Notes
+## Other Changes
 
-- The Web UI is disabled by default. Enable `PluginSettings.WebUi.Enabled` and
-  configure a separate `WebUi.Token` containing 32–256 printable ASCII characters
-  without spaces. Access defaults to loopback; use an SSH tunnel or HTTPS reverse
-  proxy for remote administration.
-- Exemption changes require a server restart. Exemptions do not bypass TLS
-  authentication or frps callback authorization.
-- Journal monitoring requires Linux, `journalctl`, a valid systemd unit, and
-  journal read permissions. Rules match message bodies without syslog prefixes;
-  adapt file-based patterns accordingly. Only new entries are monitored, and
-  no journal cursor is retained across client restarts.
-- Keep the configured ban-file directory writable. Management requests return
-  HTTP `503` if changes cannot be saved; fix storage and retry the request.
+- Rules are validated and compiled once at load time, and each rule owns its
+  threshold counters. Invalid rules and unreadable rule files are still logged
+  and skipped.
+- Startup validation errors are reported once, concisely. If a client
+  component fails or reconnection is exhausted, the client exits with code 1 so
+  the service manager can restart it.
+- frps `/handler` callbacks are logged at Debug instead of two Information lines
+  per user connection.
+- Dependencies use stable releases: Serilog 4.4.0, Serilog.Sinks.File 7.0.0,
+  Serilog.AspNetCore 11.0.0 and Serilog.Extensions.Logging 11.0.0.
+
+## Upgrade Notes
+
+1. Stop all clients, then upgrade and restart the server.
+2. Before starting the server, check that every `AllowedPluginAddresses`,
+   `WebUi.AllowedAddresses` and `ExemptAddresses` CIDR uses its network address.
+3. If the TLS listener must remain IPv4-only, set `Tls.ListenAddress` to
+   `0.0.0.0`.
+4. Upgrade the clients, remove `ClientSettings.Tls.Enabled`, and check rules for
+   integers with leading zeros.
+5. Persisted ban files, rule files and the Web UI configuration are unchanged
+   and need no migration.
