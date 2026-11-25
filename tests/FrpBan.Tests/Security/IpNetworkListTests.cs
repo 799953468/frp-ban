@@ -3,7 +3,7 @@ using Xunit;
 
 namespace FrpBan.Tests.Security;
 
-public class IpExemptionListTests
+public class IpNetworkListTests
 {
     [Theory]
     [InlineData("192.0.2.1", "192.0.2.1", true)]
@@ -39,7 +39,7 @@ public class IpExemptionListTests
     [InlineData("192.0.2.1", null, false)]
     public void Contains_MatchesCanonicalAddressesAndNetworkBoundaries(string entry, string? address, bool expected)
     {
-        var exemptions = new IpExemptionList([entry]);
+        var exemptions = new IpNetworkList([entry]);
 
         Assert.Equal(expected, exemptions.Contains(address));
     }
@@ -47,7 +47,7 @@ public class IpExemptionListTests
     [Fact]
     public void EmptyList_DoesNotExemptAnyAddress()
     {
-        var exemptions = new IpExemptionList([]);
+        var exemptions = new IpNetworkList([]);
 
         Assert.False(exemptions.Contains("127.0.0.1"));
         Assert.False(exemptions.Contains("::1"));
@@ -58,7 +58,7 @@ public class IpExemptionListTests
     public void Entries_AreSnapshottedAtConstruction()
     {
         var entries = new List<string> { "192.0.2.1", "2001:db8::/32" };
-        var exemptions = new IpExemptionList(entries);
+        var exemptions = new IpNetworkList(entries);
 
         entries.Clear();
         entries.Add("198.51.100.1");

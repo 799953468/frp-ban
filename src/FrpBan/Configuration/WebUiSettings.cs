@@ -15,7 +15,7 @@ public sealed class WebUiSettings
     /// <summary>Trusted socket IPs/CIDRs. Empty permits any address with a valid management token.</summary>
     public List<string> AllowedAddresses { get; set; } = ["127.0.0.1", "::1"];
 
-    /// <summary>Validates enabled management settings without reflection for Native AOT.</summary>
+    /// <summary>Validates enabled management settings.</summary>
     /// <param name="clientToken">The TLS client token, which must not grant management access.</param>
     /// <returns>Configuration errors that prevent the server from starting.</returns>
     public IEnumerable<ValidationResult> Validate(string clientToken)
@@ -37,18 +37,9 @@ public sealed class WebUiSettings
             yield return new ValidationResult("WebUi.Token must differ from the TLS client Token.");
         }
 
-        if (AllowedAddresses is null)
+        foreach (var result in IpNetworkList.Validate(AllowedAddresses, "WebUi.AllowedAddresses"))
         {
-            yield return new ValidationResult("WebUi.AllowedAddresses must be an array of IP addresses or CIDR networks.");
-            yield break;
-        }
-
-        foreach (var address in AllowedAddresses)
-        {
-            if (!IpExemptionList.TryParseNetwork(address, out _))
-            {
-                yield return new ValidationResult($"Invalid WebUi.AllowedAddresses entry: '{address}'.");
-            }
+            yield return result;
         }
     }
 }

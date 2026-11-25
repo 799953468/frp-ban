@@ -62,7 +62,7 @@ public sealed class PluginSettings : IValidatableObject
         return Validate();
     }
 
-    /// <summary>Validates settings without reflection so checks also run in Native AOT builds.</summary>
+    /// <summary>Returns every configuration error; used by <see cref="PluginSettingsValidator"/> at startup.</summary>
     public IEnumerable<ValidationResult> Validate()
     {
         if (string.IsNullOrWhiteSpace(Token) || Token.StartsWith("CHANGE_ME", StringComparison.OrdinalIgnoreCase) || Token.Length < 32)
@@ -85,22 +85,14 @@ public sealed class PluginSettings : IValidatableObject
             yield return new ValidationResult("MaxBanEntries must be between 1 and 1000000.");
         }
 
-        if (ExemptAddresses is null)
+        foreach (var result in IpNetworkList.Validate(AllowedPluginAddresses, nameof(AllowedPluginAddresses)))
         {
-            yield return new ValidationResult("ExemptAddresses must be an array of IP addresses or CIDR networks.",
-                [nameof(ExemptAddresses)]);
+            yield return result;
         }
-        else
+
+        foreach (var result in IpNetworkList.Validate(ExemptAddresses, nameof(ExemptAddresses)))
         {
-            foreach (var entry in ExemptAddresses)
-            {
-                if (!IpExemptionList.TryParseNetwork(entry, out _))
-                {
-                    yield return new ValidationResult(
-                        $"Invalid ExemptAddresses entry: '{entry}'. Expected an IP address or CIDR network with no host bits set.",
-                        [nameof(ExemptAddresses)]);
-                }
-            }
+            yield return result;
         }
 
         if (WebUi is null)
@@ -200,7 +192,7 @@ public sealed class TlsSettings : IValidatableObject
         return Validate();
     }
 
-    /// <summary>Validates settings without reflection so checks also run in Native AOT builds.</summary>
+    /// <summary>Returns every configuration error; used by <see cref="PluginSettingsValidator"/> at startup.</summary>
     public IEnumerable<ValidationResult> Validate()
     {
         if (Port is < 1 or > 65535 || MaxConcurrentConnections is < 1 or > 10000 ||

@@ -30,7 +30,7 @@ public static class ManagementEndpoints
             throw new OptionsValidationException(nameof(PluginSettings), typeof(PluginSettings), errors);
         }
 
-        var allowedAddresses = new IpExemptionList(settings.WebUi.AllowedAddresses);
+        var allowedAddresses = new IpNetworkList(settings.WebUi.AllowedAddresses, "WebUi.AllowedAddresses");
         var tokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(settings.WebUi.Token));
         var limiter = new IpRateLimiter(120);
 
@@ -51,7 +51,7 @@ public static class ManagementEndpoints
                 "img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
             var address = context.Connection.RemoteIpAddress;
-            if (address is null || (settings.WebUi.AllowedAddresses.Count != 0 && !allowedAddresses.Contains(address.ToString())))
+            if (address is null || (!allowedAddresses.IsEmpty && !allowedAddresses.Contains(address)))
             {
                 await Error("Management access is not allowed from this address.", StatusCodes.Status403Forbidden).ExecuteAsync(context);
                 return;
@@ -59,8 +59,7 @@ public static class ManagementEndpoints
 
             if (context.Request.Path.StartsWithSegments("/admin/api", StringComparison.OrdinalIgnoreCase))
             {
-                var rateLimitKey = address.IsIPv4MappedToIPv6 ? address.MapToIPv4().ToString() : address.ToString();
-                if (!limiter.TryAcquire(rateLimitKey))
+                if (!limiter.TryAcquire(IpAddressUtilities.Normalize(address.ToString())!))
                 {
                     context.Response.Headers.RetryAfter = "60";
                     await Error("Too many management requests. Try again in one minute.", StatusCodes.Status429TooManyRequests).ExecuteAsync(context);
@@ -159,32 +158,33 @@ public static class ManagementEndpoints
             return Error("The ban request must contain valid JSON.", StatusCodes.Status400BadRequest);
         }
 
-        var ip = IpAddressUtilities.Normalize(request?.Ip);
-        if (ip is null || string.IsNullOrWhiteSpace(request?.Reason) || request.Reason.Length > 1024 || request.DurationSeconds < 0)
+        if (request is null)
         {
-            return Error("Provide a valid IP address, a reason of 1–1024 characters, and a non-negative duration in seconds.", StatusCodes.Status400BadRequest);
+            return InvalidBanRequest();
         }
 
-        if (bans.IsExempt(ip))
-        {
-            return Error("This address is exempt from bans. Check ExemptAddresses in the server configuration.", StatusCodes.Status409Conflict);
-        }
-
+        BanStatus status;
         try
         {
-            await bans.BanAsync(ip, request.Reason.Trim(), request.DurationSeconds);
-        }
-        catch (InvalidOperationException)
-        {
-            return Error("Ban capacity reached. Remove an existing ban before adding another.", StatusCodes.Status409Conflict);
+            status = await bans.BanAsync(request.Ip ?? string.Empty, request.Reason ?? string.Empty, request.DurationSeconds);
         }
         catch (IOException)
         {
             return Error("Ban changes could not be saved. Check server storage and retry.", StatusCodes.Status503ServiceUnavailable);
         }
 
-        return Results.NoContent();
+        return status switch
+        {
+            BanStatus.Applied or BanStatus.AlreadyBanned => Results.NoContent(),
+            BanStatus.Exempt => Error("This address is exempt from bans. Check ExemptAddresses in the server configuration.", StatusCodes.Status409Conflict),
+            BanStatus.CapacityReached => Error("Ban capacity reached. Remove an existing ban before adding another.", StatusCodes.Status409Conflict),
+            _ => InvalidBanRequest(),
+        };
     }
+
+    private static IResult InvalidBanRequest() => Error(
+        "Provide a valid IP address, a reason of 1–1024 characters, and a non-negative duration in seconds.",
+        StatusCodes.Status400BadRequest);
 
     private static async Task<IResult> RemoveBanAsync(string ip, IBanService bans)
     {

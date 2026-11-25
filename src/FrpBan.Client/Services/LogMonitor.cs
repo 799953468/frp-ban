@@ -11,13 +11,13 @@ public abstract class LogMonitor
     protected readonly ILogger _logger;
     protected readonly BanRule _rule;
     protected readonly RuleMatchEngine _matchEngine;
-    protected readonly Func<List<(string ip, int? durationSeconds, string reason)>, Task> _onMatches;
+    protected readonly Func<IReadOnlyList<BanMatch>, Task> _onMatches;
 
     protected LogMonitor(
         ILogger logger,
         BanRule rule,
         RuleMatchEngine matchEngine,
-        Func<List<(string ip, int? durationSeconds, string reason)>, Task> onMatches)
+        Func<IReadOnlyList<BanMatch>, Task> onMatches)
     {
         _logger = logger;
         _rule = rule;
@@ -36,7 +36,7 @@ public abstract class LogMonitor
     public static LogMonitor Create(
         BanRule rule,
         RuleMatchEngine matchEngine,
-        Func<List<(string ip, int? durationSeconds, string reason)>, Task> onMatches,
+        Func<IReadOnlyList<BanMatch>, Task> onMatches,
         ILogger logger)
     {
         return rule.LogSource.Type switch

@@ -28,6 +28,19 @@ public class PluginAddressFilterTests
     [InlineData("192.0.2.0/33")]
     [InlineData("::/129")]
     [InlineData("not-an-address")]
-    public void InvalidWhitelist_FailsStartup(string entry) => Assert.Throws<FormatException>(() =>
-        new PluginAddressFilter(Options.Create(new PluginSettings { AllowedPluginAddresses = [entry] })));
+    [InlineData("192.0.2.1/24")]
+    public void InvalidWhitelist_FailsStartup(string entry)
+    {
+        var settings = new PluginSettings { AllowedPluginAddresses = [entry] };
+        Assert.Contains(settings.Validate(), result => result.MemberNames.Contains(nameof(PluginSettings.AllowedPluginAddresses)));
+        var error = Assert.Throws<ArgumentException>(() => new PluginAddressFilter(Options.Create(settings)));
+        Assert.Contains(nameof(PluginSettings.AllowedPluginAddresses), error.Message);
+    }
+
+    [Fact]
+    public void EmptyWhitelist_AllowsEveryPeer()
+    {
+        var filter = new PluginAddressFilter(Options.Create(new PluginSettings { AllowedPluginAddresses = [] }));
+        Assert.True(filter.IsAllowed(IPAddress.Parse("203.0.113.1")));
+    }
 }

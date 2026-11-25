@@ -17,16 +17,16 @@ public sealed class RuleMatchEngine(ILogger<RuleMatchEngine> logger, TimeProvide
     private readonly ConditionalWeakTable<BanRule, RuleState> _states = new();
 
     /// <summary>Returns canonical IP ban requests for a single complete log line.</summary>
-    public List<(string ip, int? durationSeconds, string reason)> ProcessLogLine(string logLine, BanRule rule)
+    public IReadOnlyList<BanMatch> ProcessLogLine(string logLine, BanRule rule)
     {
-        var results = new List<(string ip, int? durationSeconds, string reason)>();
+        var results = new List<BanMatch>();
         if (!rule.Enabled || logLine.Length > MaxLogLineLength || rule.Action.BanDurationSeconds < 0)
             return results;
         var ips = ExtractIps(logLine, rule.Matching);
         if (rule.Action.Type == "immediate")
         {
             foreach (var ip in ips)
-                results.Add((ip, rule.Action.BanDurationSeconds, rule.Action.Reason));
+                results.Add(new BanMatch(ip, rule.Action.BanDurationSeconds, rule.Action.Reason));
             return results;
         }
         if (rule.Action.Type != "threshold" || rule.Action.MaxMatches < 1 || rule.Action.WindowSeconds < 1)
@@ -66,7 +66,7 @@ public sealed class RuleMatchEngine(ILogger<RuleMatchEngine> logger, TimeProvide
                 if (matches.Count >= rule.Action.MaxMatches)
                 {
                     state.Matches.Remove(ip);
-                    results.Add((ip, rule.Action.BanDurationSeconds, rule.Action.Reason));
+                    results.Add(new BanMatch(ip, rule.Action.BanDurationSeconds, rule.Action.Reason));
                 }
             }
         }

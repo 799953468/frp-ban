@@ -88,7 +88,7 @@ public class FileLogMonitorTests
             var monitor = new FileLogMonitor(NullLogger.Instance, rule,
                 new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance), matches =>
                 {
-                    foreach (var match in matches) fixture.Matches.Writer.TryWrite(match.ip);
+                    foreach (var match in matches) fixture.Matches.Writer.TryWrite(match.Ip);
                     return Task.CompletedTask;
                 });
             fixture._task = monitor.StartAsync(fixture._stopping.Token);

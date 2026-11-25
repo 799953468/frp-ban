@@ -27,7 +27,8 @@ public static class PluginEndpoints
 
             await next(context);
         });
-        app.MapPost("/handler", async ([FromBody] PluginRequest request, HttpContext context, PluginRequestHandler handler) =>
-        Results.Json(await handler.HandleAsync(request, context), ServerJsonContext.Default.PluginResponse));
+        app.MapPost("/handler", ([FromBody] PluginRequest request, HttpContext context, PluginRequestHandler handler) =>
+            Results.Json(handler.Handle(request, context.Request.Headers["X-Frp-Reqid"].ToString()),
+                ServerJsonContext.Default.PluginResponse));
     }
 }

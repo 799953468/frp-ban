@@ -28,7 +28,7 @@ public class RuleEngineSafetyTests
         Parallel.For(0, 1000, _ =>
         {
             foreach (var result in engine.ProcessLogLine("192.0.2.1 failed", rule))
-                results.Add(result.ip);
+                results.Add(result.Ip);
         });
         Assert.Equal(20, results.Count);
     }
@@ -73,7 +73,7 @@ public class RuleEngineSafetyTests
             Action = new BanAction { Type = "immediate" },
         };
         var result = CreateEngine().ProcessLogLine("{\"status\":401,\"request\":{\"ip\":\"192.0.2.1\"}}", rule);
-        Assert.Equal("192.0.2.1", Assert.Single(result).ip);
+        Assert.Equal("192.0.2.1", Assert.Single(result).Ip);
     }
 
     [Fact]

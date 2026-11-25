@@ -2,7 +2,7 @@ using Microsoft.Extensions.Options;
 
 namespace FrpBan.Configuration;
 
-/// <summary>Runs the server's startup checks without reflection-based validation.</summary>
+/// <summary>Runs <see cref="PluginSettings.Validate()"/> when options are first resolved and at startup.</summary>
 public sealed class PluginSettingsValidator : IValidateOptions<PluginSettings>
 {
     /// <inheritdoc />

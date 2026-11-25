@@ -151,7 +151,8 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
                 await stream.AuthenticateAsServerAsync(options, handshake.Token).ConfigureAwait(false);
 
                 var first = await MessageTransport.ReadAsync(stream, handshake.Token).ConfigureAwait(false);
-                if (first is not HelloMessage hello || hello.Version != "1.0" || !ValidateToken(hello.TokenHash))
+                if (first is not HelloMessage hello || hello.Version != ProtocolConstants.Version ||
+                    !ValidateToken(hello.TokenHash))
                 {
                     await WriteAsync(stream, new ErrorMessage("Invalid handshake or token"), cancellationToken);
                     return;
@@ -159,7 +160,8 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
                 if (!_messageLimiter.TryAcquire(address))
                     return;
                 // TLS authenticates the server. Do not echo a reusable credential back to the peer.
-                await WriteAsync(stream, new HelloMessage("1.0", "server", ""), cancellationToken);
+                await WriteAsync(stream, new HelloMessage(ProtocolConstants.Version, ProtocolConstants.ServerClientType, ""),
+                    cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
@@ -215,32 +217,27 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
 
     private async Task<Message> HandleBanRequestAsync(BanRequestMessage request)
     {
-        if (IpAddressUtilities.Normalize(request.Ip) is null || request.DurationSeconds is < 0)
-        {
-            return new BanResponseMessage(false, "Invalid IP address or duration");
-        }
-
-        if (request.Reason?.Length > 1024)
-        {
-            return new BanResponseMessage(false, "Reason exceeds 1024 characters");
-        }
-
+        var reason = string.IsNullOrWhiteSpace(request.Reason) ? "client request" : request.Reason;
+        BanStatus status;
         try
         {
-            if (_banService.IsExempt(request.Ip))
-            {
-                return new BanResponseMessage(false, $"IP {request.Ip} is exempt from bans");
-            }
-
-            await _banService.BanAsync(request.Ip, request.Reason ?? "client request", request.DurationSeconds)
-                .ConfigureAwait(false);
-            return new BanResponseMessage(true, $"Banned {request.Ip}");
+            status = await _banService.BanAsync(request.Ip, reason, request.DurationSeconds).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (IOException ex)
         {
-            _logger.LogError(ex, "Failed to ban {Ip}", request.Ip);
-            return new BanResponseMessage(false, "Unable to apply ban");
+            _logger.LogError(ex, "Ban for {Ip} is active but could not be persisted", request.Ip);
+            status = BanStatus.StorageUnavailable;
         }
+
+        return new BanResponseMessage(status, status switch
+        {
+            BanStatus.Applied => $"Banned {request.Ip}",
+            BanStatus.AlreadyBanned => $"IP {request.Ip} is already banned",
+            BanStatus.Exempt => $"IP {request.Ip} is exempt from bans",
+            BanStatus.CapacityReached => "Ban capacity reached",
+            BanStatus.StorageUnavailable => "Ban is active but not yet persisted; retry later",
+            _ => "Invalid IP address, reason, or duration",
+        });
     }
 
     private async Task WriteAsync(SslStream stream, Message message, CancellationToken cancellationToken)
@@ -254,10 +251,14 @@ public sealed class TcpServerService : IHostedService, IDisposable, IAsyncDispos
     {
         var address = IPAddress.Parse(listenAddress);
         if (address.Equals(IPAddress.IPv6Any) && !Socket.OSSupportsIPv6)
+        {
             address = IPAddress.Any;
+        }
         var listener = new TcpListener(address, port);
         if (address.Equals(IPAddress.IPv6Any))
+        {
             listener.Server.DualMode = true;
+        }
         return listener;
     }
 

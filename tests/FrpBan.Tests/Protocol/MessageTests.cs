@@ -63,7 +63,7 @@ public class MessageTests
     public void BanResponseMessage_SuccessTrue_StoresValues()
     {
         // Arrange
-        var message = new BanResponseMessage(true, "Ban applied successfully");
+        var message = new BanResponseMessage(BanStatus.Applied, "Ban applied successfully");
 
         // Act & Assert
         Assert.True(message.Success);
@@ -75,10 +75,11 @@ public class MessageTests
     public void BanResponseMessage_SuccessFalse_StoresValues()
     {
         // Arrange
-        var message = new BanResponseMessage(false, "Ban failed");
+        var message = new BanResponseMessage(BanStatus.CapacityReached, "Ban failed");
 
         // Act & Assert
         Assert.False(message.Success);
+        Assert.False(message.Status.IsRetryable());
         Assert.Equal("Ban failed", message.Message);
     }
 

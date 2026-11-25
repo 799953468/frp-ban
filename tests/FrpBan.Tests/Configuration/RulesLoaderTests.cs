@@ -23,7 +23,7 @@ public class RulesLoaderTests
                 Assert.Empty(engine.ProcessLogLine(line, rule));
             }
 
-            Assert.Equal("192.0.2.1", Assert.Single(engine.ProcessLogLine(line, rule)).ip);
+            Assert.Equal("192.0.2.1", Assert.Single(engine.ProcessLogLine(line, rule)).Ip);
         }
     }
 
@@ -106,7 +106,7 @@ public class RulesLoaderTests
         }
 
         Assert.Equal("192.0.2.1", Assert.Single(engine.ProcessLogLine(
-            """{"event":"null","address":"192.0.2.1"}""", rule)).ip);
+            """{"event":"null","address":"192.0.2.1"}""", rule)).Ip);
     }
 
     [Theory]

@@ -73,15 +73,14 @@ try
     // -------------------------------------------------------------------------
     builder.Services.AddSingleton<BanService>();
     builder.Services.AddSingleton<IBanService>(sp => sp.GetRequiredService<BanService>());
+    // Hosted services start in registration order, before Kestrel: load bans, then accept TLS clients.
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<BanService>());
+    builder.Services.AddHostedService<TcpServerService>();
     builder.Services.AddSingleton<PluginRequestHandler>();
     builder.Services.AddSingleton<PluginAddressFilter>();
     builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 65536);
-    builder.Services.AddHostedService<TcpServerService>();
 
     await using var app = builder.Build();
-
-    // Load persisted bans before accepting traffic.
-    app.Services.GetRequiredService<BanService>().Load();
 
     // -------------------------------------------------------------------------
     // Middleware

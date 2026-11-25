@@ -41,7 +41,7 @@ public class TlsIntegrationTests : IAsyncLifetime
         await File.WriteAllBytesAsync(Path.Combine(_directory, "client.pfx"), client.Export(X509ContentType.Pfx));
         await File.WriteAllBytesAsync(Path.Combine(_directory, "other.pfx"), otherClient.Export(X509ContentType.Pfx));
         _bans.Setup(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()))
-            .Returns(Task.CompletedTask);
+            .ReturnsAsync(BanStatus.Applied);
         _server = await StartServerAsync();
     }
 
@@ -79,7 +79,7 @@ public class TlsIntegrationTests : IAsyncLifetime
     {
         using var client = CreateClient();
         Assert.True(await client.ConnectAsync(CancellationToken.None));
-        Assert.True(await client.SendBanRequestAsync("192.0.2.1", null, null, CancellationToken.None));
+        Assert.True(await SendBanAsync(client, "192.0.2.1", null, null, CancellationToken.None));
         Assert.True(await client.SendPingAsync(CancellationToken.None));
     }
 
@@ -90,7 +90,7 @@ public class TlsIntegrationTests : IAsyncLifetime
         Assert.True(await client.ConnectAsync(CancellationToken.None));
         var exchanges = Enumerable.Range(0, 20).SelectMany(i => new[]
         {
-            client.SendBanRequestAsync($"192.0.2.{i}", "test", 60, CancellationToken.None),
+            SendBanAsync(client, $"192.0.2.{i}", "test", 60, CancellationToken.None),
             client.SendPingAsync(CancellationToken.None),
         });
         Assert.All(await Task.WhenAll(exchanges), Assert.True);
@@ -108,11 +108,55 @@ public class TlsIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task NegativeDuration_IsRejectedBeforeChangingStorage()
     {
-        using var client = CreateClient();
+        await using var store = new BanService(Options.Create(new PluginSettings
+        {
+            BanFilePath = Path.Combine(_directory, "bans.json"),
+        }), NullLogger<BanService>.Instance);
+        var server = await StartServerAsync(bans: store);
+        using var client = CreateClient(server);
         Assert.True(await client.ConnectAsync(CancellationToken.None));
-        Assert.False(await client.SendBanRequestAsync("192.0.2.1", "test", -1, CancellationToken.None));
-        _bans.Verify(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()), Times.Never);
+        Assert.Equal(BanStatus.Invalid,
+            await client.SendBanRequestAsync(new BanRequestMessage("192.0.2.1", "test", -1), CancellationToken.None));
+        Assert.Empty(store.GetActiveBans());
+        Assert.False(File.Exists(Path.Combine(_directory, "bans.json")));
     }
+
+    [Fact]
+    public async Task StorageFailure_IsRetriedUntilTheBanIsDurable()
+    {
+        var attempts = 0;
+        _bans.Setup(service => service.BanAsync("192.0.2.18", "retry", 60))
+            .Returns(() => Interlocked.Increment(ref attempts) == 1
+                ? Task.FromException<BanStatus>(new IOException("disk full"))
+                : Task.FromResult(BanStatus.Applied));
+        using var client = CreateClient();
+        using var stopping = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        Assert.True(await client.ConnectAsync(stopping.Token));
+        var delivery = new BanDeliveryService(client,
+            Options.Create(new ClientSettings { Reconnection = new ReconnectionSettings { InitialDelayMs = 10 } }),
+            NullLogger<BanDeliveryService>.Instance);
+        await delivery.EnqueueAsync(new BanMatch("192.0.2.18", 60, "retry"), stopping.Token);
+        var worker = delivery.RunAsync(stopping.Token);
+        try
+        {
+            while (Volatile.Read(ref attempts) < 2)
+            {
+                await Task.Delay(10, stopping.Token);
+            }
+
+            Assert.True(client.IsConnected);
+        }
+        finally
+        {
+            await stopping.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker);
+        }
+    }
+
+    private static async Task<bool> SendBanAsync(ClientConnectionService client, string ip, string? reason,
+        int? durationSeconds, CancellationToken cancellationToken) =>
+        (await client.SendBanRequestAsync(new BanRequestMessage(ip, reason, durationSeconds), cancellationToken))
+        ?.IsSuccess() == true;
 
     [Theory]
     [InlineData(0)]
@@ -132,11 +176,11 @@ public class TlsIntegrationTests : IAsyncLifetime
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
         Assert.True(await client.ConnectAsync(deadline.Token));
-        Assert.True(await client.SendBanRequestAsync("192.0.2.10", "Original stronger ban", originalDuration,
+        Assert.True(await SendBanAsync(client, "192.0.2.10", "Original stronger ban", originalDuration,
             deadline.Token));
         var original = Assert.Single(store.GetActiveBans());
 
-        Assert.True(await client.SendBanRequestAsync("::ffff:192.0.2.10", "Weaker request", 1, deadline.Token));
+        Assert.True(await SendBanAsync(client, "::ffff:192.0.2.10", "Weaker request", 1, deadline.Token));
 
         Assert.Equal(original, Assert.Single(store.GetActiveBans()));
     }
@@ -162,7 +206,7 @@ public class TlsIntegrationTests : IAsyncLifetime
                         TargetHost = "localhost",
                         EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                     }, deadline.Token);
-                    var hello = new HelloMessage("1.0", "client",
+                    var hello = new HelloMessage(ProtocolConstants.Version, "client",
                         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Token))));
                     await tls.WriteAsync(hello.Serialize(), deadline.Token);
                     Assert.IsType<HelloMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
@@ -202,8 +246,8 @@ public class TlsIntegrationTests : IAsyncLifetime
                 Assert.True(await client.ConnectAsync(stopping.Token));
                 var delivery = new BanDeliveryService(client, Options.Create(new ClientSettings()),
                     NullLogger<BanDeliveryService>.Instance);
-                await delivery.EnqueueAsync("::ffff:192.0.2.1", "exempt", 0, stopping.Token);
-                await delivery.EnqueueAsync("198.51.100.1", "blocked", 0, stopping.Token);
+                await delivery.EnqueueAsync(new BanMatch("::ffff:192.0.2.1", 0, "exempt"), stopping.Token);
+                await delivery.EnqueueAsync(new BanMatch("198.51.100.1", 0, "blocked"), stopping.Token);
                 var worker = delivery.RunAsync(stopping.Token);
                 try
                 {
@@ -236,13 +280,13 @@ public class TlsIntegrationTests : IAsyncLifetime
         using var stopping = new CancellationTokenSource();
         var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _bans.Setup(service => service.BanAsync("192.0.2.17", "queued", 60))
-            .Returns(() => { delivered.TrySetResult(); return Task.CompletedTask; });
+            .Returns(() => { delivered.TrySetResult(); return Task.FromResult(BanStatus.Applied); });
         var delivery = new BanDeliveryService(client, Options.Create(new ClientSettings()),
             NullLogger<BanDeliveryService>.Instance);
         var worker = delivery.RunAsync(stopping.Token);
         try
         {
-            await delivery.EnqueueAsync("192.0.2.17", "queued", 60, stopping.Token);
+            await delivery.EnqueueAsync(new BanMatch("192.0.2.17", 60, "queued"), stopping.Token);
             Assert.False(delivered.Task.IsCompleted);
             Assert.True(await client.ConnectAsync(stopping.Token));
             await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -272,7 +316,7 @@ public class TlsIntegrationTests : IAsyncLifetime
         using var client = CreateClient(server);
         Assert.True(await client.ConnectAsync(CancellationToken.None));
         Assert.True(await client.SendPingAsync(CancellationToken.None));
-        Assert.False(await client.SendBanRequestAsync("192.0.2.1", "test", 60, CancellationToken.None));
+        Assert.False(await SendBanAsync(client, "192.0.2.1", "test", 60, CancellationToken.None));
         _bans.Verify(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()), Times.Never);
     }
 
@@ -287,12 +331,24 @@ public class TlsIntegrationTests : IAsyncLifetime
         {
             TargetHost = "localhost", EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
         }, deadline.Token);
-        var hello = new HelloMessage("1.0", "client", Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("wrong"))));
+        var hello = new HelloMessage(ProtocolConstants.Version, "client", Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("wrong"))));
         var payload = hello.Serialize().Concat(new BanRequestMessage("192.0.2.1", "test", 60).Serialize()).ToArray();
         await tls.WriteAsync(payload, deadline.Token);
         Assert.IsType<ErrorMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
         Assert.Null(await MessageTransport.ReadAsync(tls, deadline.Token));
         _bans.Verify(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task PreviousProtocolVersion_IsRejectedEvenWithValidToken()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var client = new TcpClient();
+        await using var tls = await OpenRawTlsAsync(client, "127.0.0.1", deadline.Token);
+        var hello = new HelloMessage("1.0", ProtocolConstants.ClientClientType,
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Token))));
+        await tls.WriteAsync(hello.Serialize(), deadline.Token);
+        Assert.IsType<ErrorMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
     }
 
     [Fact]
@@ -326,7 +382,7 @@ public class TlsIntegrationTests : IAsyncLifetime
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         using var client = new TcpClient(System.Net.Sockets.AddressFamily.InterNetworkV6);
         await using var tls = await OpenRawTlsAsync(client, "::1", deadline.Token);
-        var hello = new HelloMessage("1.0", "frp-ban-client",
+        var hello = new HelloMessage(ProtocolConstants.Version, ProtocolConstants.ClientClientType,
             Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Token))));
         await tls.WriteAsync(hello.Serialize(), deadline.Token);
         Assert.IsType<HelloMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));

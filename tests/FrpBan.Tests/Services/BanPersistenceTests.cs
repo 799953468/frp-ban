@@ -1,3 +1,4 @@
+using FrpBan.Protocol;
 using System.Text.Json;
 using FrpBan.Configuration;
 using FrpBan.Models;
@@ -209,8 +210,8 @@ public class BanPersistenceTests : IDisposable
     public async Task InvalidInput_DoesNotCreateBans()
     {
         await using var service = Create();
-        await Assert.ThrowsAsync<ArgumentException>(() => service.BanAsync("not-an-ip", "test"));
-        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => service.BanAsync("192.0.2.1", "test", -1));
+        Assert.Equal(BanStatus.Invalid, await service.BanAsync("not-an-ip", "test"));
+        Assert.Equal(BanStatus.Invalid, await service.BanAsync("192.0.2.1", "test", -1));
         Assert.Empty(service.GetActiveBans());
     }
 
@@ -219,7 +220,7 @@ public class BanPersistenceTests : IDisposable
     {
         await using var service = Create(capacity: 1);
         await service.BanAsync("192.0.2.1", "first");
-        await Assert.ThrowsAsync<InvalidOperationException>(() => service.BanAsync("192.0.2.2", "second"));
+        Assert.Equal(BanStatus.CapacityReached, await service.BanAsync("192.0.2.2", "second"));
         await service.BanAsync("192.0.2.1", "updated");
         Assert.Equal("updated", Assert.Single(service.GetActiveBans()).Reason);
     }

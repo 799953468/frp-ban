@@ -6,12 +6,13 @@ using Microsoft.Extensions.Options;
 
 namespace FrpBan.Client.Services;
 
-/// <summary>Buffers pending bans with bounded memory and retries delivery after a reconnect.</summary>
+/// <summary>Buffers pending bans with bounded memory and delivers them in order once connected.</summary>
 public sealed class BanDeliveryService
 {
     private readonly ClientConnectionService _connection;
     private readonly ILogger<BanDeliveryService> _logger;
     private readonly Channel<BanRequestMessage> _pending;
+    private readonly TimeSpan _retryDelay;
 
     /// <summary>Creates a single-consumer delivery queue with backpressure.</summary>
     public BanDeliveryService(ClientConnectionService connection, IOptions<ClientSettings> settings,
@@ -19,6 +20,7 @@ public sealed class BanDeliveryService
     {
         _connection = connection;
         _logger = logger;
+        _retryDelay = TimeSpan.FromMilliseconds(settings.Value.Reconnection.InitialDelayMs);
         _pending = Channel.CreateBounded<BanRequestMessage>(new BoundedChannelOptions(settings.Value.MaxPendingBans)
         {
             SingleReader = true,
@@ -27,30 +29,37 @@ public sealed class BanDeliveryService
     }
 
     /// <summary>Queues a ban, waiting when the configured memory budget is full.</summary>
-    public ValueTask EnqueueAsync(string ip, string reason, int? durationSeconds, CancellationToken cancellationToken) =>
-        _pending.Writer.WriteAsync(new BanRequestMessage(ip, reason, durationSeconds), cancellationToken);
+    public ValueTask EnqueueAsync(BanMatch match, CancellationToken cancellationToken) =>
+        _pending.Writer.WriteAsync(new BanRequestMessage(match.Ip, match.Reason, match.DurationSeconds), cancellationToken);
 
-    /// <summary>Delivers queued bans until shutdown, retaining the current ban across transport failures.</summary>
+    /// <summary>
+    /// Delivers queued bans until shutdown. A ban stays at the head of the queue across transport
+    /// failures and retryable server statuses; terminal statuses (exempt, invalid, capacity) drop it.
+    /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         await foreach (var ban in _pending.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (true)
             {
                 if (!_connection.IsConnected)
                 {
                     await Task.Delay(250, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
-                if (await _connection.SendBanRequestAsync(ban.Ip, ban.Reason, ban.DurationSeconds, cancellationToken)
-                        .ConfigureAwait(false))
-                    break;
-                if (_connection.IsConnected)
+
+                var status = await _connection.SendBanRequestAsync(ban, cancellationToken).ConfigureAwait(false);
+                if (status is null)
+                    continue;
+                if (status.Value.IsRetryable())
                 {
-                    // A negative BAN_RESPONSE is a terminal rejection; do not block the queue forever.
-                    _logger.LogWarning("Server rejected queued ban for {Ip}", ban.Ip);
-                    break;
+                    await Task.Delay(_retryDelay, cancellationToken).ConfigureAwait(false);
+                    continue;
                 }
+
+                if (!status.Value.IsSuccess())
+                    _logger.LogWarning("Dropping queued ban for {Ip}: server returned {Status}", ban.Ip, status);
+                break;
             }
         }
     }

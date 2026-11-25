@@ -88,7 +88,7 @@ public class DefaultSshRuleSecurityTests
                 Assert.Empty(engine.ProcessLogLine(line, rule));
             }
 
-            Assert.Equal(expectedIp, Assert.Single(engine.ProcessLogLine(line, rule)).ip);
+            Assert.Equal(expectedIp, Assert.Single(engine.ProcessLogLine(line, rule)).Ip);
         }
     }
 

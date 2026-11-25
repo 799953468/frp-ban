@@ -4,13 +4,18 @@ using System.Text.Json.Serialization;
 namespace FrpBan.Protocol;
 
 /// <summary>
-/// Ban response message (server -> client).
+/// Ban response message (server -> client). <see cref="Status"/> tells the client whether to
+/// drop the request, or keep it queued and retry.
 /// </summary>
 public sealed record BanResponseMessage(
-    [property: JsonRequired] bool Success,
+    [property: JsonRequired] BanStatus Status,
     [property: JsonRequired] string Message
 ) : Message(MessageType.BanResponse)
 {
+    /// <summary>True when the address is durably banned.</summary>
+    [JsonIgnore]
+    public bool Success => Status.IsSuccess();
+
     protected override byte[] SerializeBody()
     {
         return JsonSerializer.SerializeToUtf8Bytes(this, ProtocolJsonContext.Default.BanResponseMessage);

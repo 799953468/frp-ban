@@ -2,6 +2,7 @@ using System.Text.Json;
 using FrpBan.Configuration;
 using FrpBan.Handlers;
 using FrpBan.Models;
+using FrpBan.Protocol;
 using FrpBan.Services;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -32,7 +33,7 @@ public class BanExemptionTests : IDisposable
         {
             Assert.True(service.IsExempt(address));
 
-            await service.BanAsync(address, "exempt", duration);
+            Assert.Equal(BanStatus.Exempt, await service.BanAsync(address, "exempt", duration));
 
             Assert.False(service.IsBanned(address));
             Assert.Empty(service.GetActiveBans());
@@ -46,15 +47,12 @@ public class BanExemptionTests : IDisposable
     {
         await using (var service = CreateService(["192.0.2.0/24"], capacity: 1))
         {
-            await service.BanAsync("192.0.2.1", "exempt", 0);
-            await service.BanAsync("198.51.100.1", "blocked", 0);
-            await service.BanAsync("192.0.2.2", "exempt after capacity reached", 0);
+            Assert.Equal(BanStatus.Exempt, await service.BanAsync("192.0.2.1", "exempt", 0));
+            Assert.Equal(BanStatus.Applied, await service.BanAsync("198.51.100.1", "blocked", 0));
+            Assert.Equal(BanStatus.Exempt, await service.BanAsync("192.0.2.2", "exempt after capacity reached", 0));
 
             Assert.Equal("198.51.100.1", Assert.Single(service.GetActiveBans()).Ip);
-            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            {
-                await service.BanAsync("198.51.100.2", "over capacity", 0);
-            });
+            Assert.Equal(BanStatus.CapacityReached, await service.BanAsync("198.51.100.2", "over capacity", 0));
         }
     }
 
@@ -75,18 +73,10 @@ public class BanExemptionTests : IDisposable
     {
         await using (var service = CreateService(["192.0.2.0/24"]))
         {
-            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
-            {
-                await service.BanAsync("192.0.2.1", "test", -1);
-            });
-            await Assert.ThrowsAsync<ArgumentNullException>(async () =>
-            {
-                await service.BanAsync("192.0.2.1", null!, 0);
-            });
-            await Assert.ThrowsAsync<ArgumentException>(async () =>
-            {
-                await service.BanAsync("192.0.2.1", new string('x', 1025), 0);
-            });
+            Assert.Equal(BanStatus.Invalid, await service.BanAsync("192.0.2.1", "test", -1));
+            Assert.Equal(BanStatus.Invalid, await service.BanAsync("192.0.2.1", null!, 0));
+            Assert.Equal(BanStatus.Invalid, await service.BanAsync("192.0.2.1", "   ", 0));
+            Assert.Equal(BanStatus.Invalid, await service.BanAsync("192.0.2.1", new string('x', 1025), 0));
             Assert.Empty(service.GetActiveBans());
         }
     }
@@ -175,8 +165,8 @@ public class BanExemptionTests : IDisposable
             var bannedRequest = new PluginRequest("0.1.0", operation,
                 JsonSerializer.SerializeToElement(new Dictionary<string, string> { [addressField] = "198.51.100.1:1234" }));
 
-            Assert.False((await handler.HandleAsync(exemptRequest, new DefaultHttpContext())).Reject);
-            Assert.True((await handler.HandleAsync(bannedRequest, new DefaultHttpContext())).Reject);
+            Assert.False(handler.Handle(exemptRequest).Reject);
+            Assert.True(handler.Handle(bannedRequest).Reject);
         }
     }
 

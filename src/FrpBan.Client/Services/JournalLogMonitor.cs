@@ -23,7 +23,7 @@ public sealed class JournalLogMonitor : LogMonitor
         ILogger logger,
         BanRule rule,
         RuleMatchEngine matchEngine,
-        Func<List<(string ip, int? durationSeconds, string reason)>, Task> onMatches)
+        Func<IReadOnlyList<BanMatch>, Task> onMatches)
         : base(logger, rule, matchEngine, onMatches)
     {
     }

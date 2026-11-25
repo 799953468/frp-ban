@@ -8,7 +8,7 @@ namespace FrpBan.Client.Services;
 /// <summary>Processes coalesced file notifications in one worker, retaining partial UTF-8 lines.</summary>
 public sealed class FileLogMonitor(
     ILogger logger, BanRule rule, RuleMatchEngine matchEngine,
-    Func<List<(string ip, int? durationSeconds, string reason)>, Task> onMatches)
+    Func<IReadOnlyList<BanMatch>, Task> onMatches)
     : LogMonitor(logger, rule, matchEngine, onMatches)
 {
     private readonly Channel<byte> _notifications = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)

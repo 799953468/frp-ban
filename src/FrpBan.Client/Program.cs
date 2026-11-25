@@ -90,11 +90,11 @@ try
             {
                 foreach (var rule in rules)
                 {
-                    async Task OnMatches(List<(string ip, int? duration, string reason)> matches)
+                    async Task OnMatches(IReadOnlyList<BanMatch> matches)
                     {
-                        foreach (var (ip, duration, reason) in matches)
+                        foreach (var match in matches)
                         {
-                            await delivery.EnqueueAsync(ip, reason, duration, stopping.Token);
+                            await delivery.EnqueueAsync(match, stopping.Token);
                         }
                     }
 

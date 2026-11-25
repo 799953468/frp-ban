@@ -64,9 +64,9 @@ public class RuleMatchEngineTests
 
         // Assert
         Assert.Single(result);
-        Assert.Equal("192.168.1.1", result[0].ip);
-        Assert.Equal("Failed login", result[0].reason);
-        Assert.Equal(3600, result[0].durationSeconds);
+        Assert.Equal("192.168.1.1", result[0].Ip);
+        Assert.Equal("Failed login", result[0].Reason);
+        Assert.Equal(3600, result[0].DurationSeconds);
     }
 
     [Fact]
@@ -101,7 +101,7 @@ public class RuleMatchEngineTests
 
         // Assert
         Assert.Single(result);
-        Assert.Equal("10.0.0.1", result[0].ip);
+        Assert.Equal("10.0.0.1", result[0].Ip);
     }
 
     [Fact]
@@ -144,7 +144,7 @@ public class RuleMatchEngineTests
 
         // Assert - Ban triggered
         Assert.Single(result3);
-        Assert.Equal("192.168.1.100", result3[0].ip);
+        Assert.Equal("192.168.1.100", result3[0].Ip);
     }
 
     [Fact]
@@ -178,7 +178,7 @@ public class RuleMatchEngineTests
 
         // Assert
         Assert.Single(result1);
-        Assert.Equal("192.168.1.50", result1[0].ip);
+        Assert.Equal("192.168.1.50", result1[0].Ip);
 
         // Act - Different status
         var result2 = engine.ProcessLogLine(@"{""ip"":""192.168.1.51"",""status"":""200""}", rule);
@@ -222,8 +222,8 @@ public class RuleMatchEngineTests
 
         // Assert
         Assert.Equal(2, result.Count);
-        Assert.Contains(result, r => r.ip == "192.168.1.1");
-        Assert.Contains(result, r => r.ip == "10.0.0.1");
+        Assert.Contains(result, r => r.Ip == "192.168.1.1");
+        Assert.Contains(result, r => r.Ip == "10.0.0.1");
     }
 
     [Fact]
@@ -318,6 +318,6 @@ public class RuleMatchEngineTests
 
         // Assert
         Assert.Single(result);
-        Assert.Equal("203.0.113.42", result[0].ip);
+        Assert.Equal("203.0.113.42", result[0].Ip);
     }
 }

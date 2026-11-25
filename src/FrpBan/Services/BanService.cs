@@ -9,12 +9,15 @@ using Microsoft.Extensions.Options;
 
 namespace FrpBan.Services;
 
-/// <summary>Canonical IP bans with a bounded, coalescing, single-writer persistence queue.</summary>
-public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
+/// <summary>
+/// Canonical IP bans with a bounded, coalescing, single-writer persistence queue.
+/// As a hosted service it loads persisted bans before the TLS listener and HTTP server start.
+/// </summary>
+public sealed class BanService : IBanService, IHostedService, IDisposable, IAsyncDisposable
 {
     private readonly PluginSettings _settings;
     private readonly ILogger<BanService> _logger;
-    private readonly IpExemptionList _exemptions;
+    private readonly IpNetworkList _exemptions;
     private readonly ConcurrentDictionary<string, BanEntry> _bans = new(StringComparer.Ordinal);
 
     private readonly Channel<byte> _changes = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
@@ -37,7 +40,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
     {
         _settings = settings.Value;
         _logger = logger;
-        _exemptions = new IpExemptionList(_settings.ExemptAddresses);
+        _exemptions = new IpNetworkList(_settings.ExemptAddresses, nameof(PluginSettings.ExemptAddresses));
         _persistenceTask = PersistLoopAsync();
         _cleanupTimer = new Timer(CleanupExpiredBans, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
         _retryTimer = new Timer(_ =>
@@ -48,6 +51,17 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             }
         }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
+
+    /// <inheritdoc/>
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        Load();
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Pending writes are flushed on disposal, after every hosted service has stopped.</remarks>
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     /// <summary>Loads active, non-exempt bans before traffic is accepted; corrupted storage fails startup.</summary>
     public void Load()
@@ -60,7 +74,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
         List<BanEntry> entries;
         using (var stream = File.OpenRead(_settings.BanFilePath))
         {
-            entries = JsonSerializer.Deserialize(stream, ServerJsonContext.Default.ListBanEntry)
+            entries = JsonSerializer.Deserialize(stream, BanStoreJsonContext.Default.ListBanEntry)
                       ?? throw new InvalidDataException("Ban file must contain a JSON array.");
         }
 
@@ -127,19 +141,17 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public Task BanAsync(string ip, string reason, int? durationSeconds = null)
+    public Task<BanStatus> BanAsync(string ip, string reason, int? durationSeconds = null)
     {
-        var key = IpAddressUtilities.Normalize(ip) ?? throw new ArgumentException("Invalid IP address.", nameof(ip));
-        ArgumentNullException.ThrowIfNull(reason);
-        if (reason.Length > 1024)
+        var key = IpAddressUtilities.Normalize(ip);
+        var duration = durationSeconds ?? _settings.DefaultBanDurationSeconds;
+        if (key is null || string.IsNullOrWhiteSpace(reason) || reason.Length > ProtocolConstants.MaxReasonLength || duration < 0)
         {
-            throw new ArgumentException("Ban reason exceeds 1024 characters.", nameof(reason));
+            return Task.FromResult(BanStatus.Invalid);
         }
 
-        var duration = durationSeconds ?? _settings.DefaultBanDurationSeconds;
-        ArgumentOutOfRangeException.ThrowIfNegative(duration);
         var now = DateTimeOffset.UtcNow;
-        var entry = new BanEntry(key, reason, now, duration == 0 ? null : now.AddSeconds(duration));
+        var entry = new BanEntry(key, reason.Trim(), now, duration == 0 ? null : now.AddSeconds(duration));
         Task persistence;
         lock (_lifecycle)
         {
@@ -147,22 +159,22 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             if (IsExempt(key))
             {
                 _logger.LogDebug("Ignored ban request for exempt address {Ip}", key);
-                return Task.CompletedTask;
+                return Task.FromResult(BanStatus.Exempt);
             }
 
             if (_bans.TryGetValue(key, out var previous))
             {
                 // A ban request may extend protection, but must never shorten or undo it.
                 // Retain the original reason and timestamp when its ban is stronger.
-                if (previous.ExpiresAt is null ||
-                    entry.ExpiresAt is { } requestedExpiry && previous.ExpiresAt >= requestedExpiry)
+                // Still wait for persistence, so success always means the ban is durable.
+                if (previous.ExpiresAt is null || entry.ExpiresAt is { } requestedExpiry && previous.ExpiresAt >= requestedExpiry)
                 {
-                    return WaitForPersistence();
+                    return CompleteAsync(WaitForPersistence(), BanStatus.AlreadyBanned);
                 }
             }
             else if (_bans.Count >= _settings.MaxBanEntries)
             {
-                throw new InvalidOperationException("Maximum ban capacity reached.");
+                return Task.FromResult(BanStatus.CapacityReached);
             }
 
             _bans[key] = entry;
@@ -170,8 +182,14 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             persistence = WaitForPersistence();
         }
 
-        _logger.LogWarning("Banned {Ip}: {Reason}, expires {Expires}", key, reason, entry.ExpiresAt);
-        return persistence;
+        _logger.LogWarning("Banned {Ip}: {Reason}, expires {Expires}", key, entry.Reason, entry.ExpiresAt);
+        return CompleteAsync(persistence, BanStatus.Applied);
+    }
+
+    private static async Task<BanStatus> CompleteAsync(Task persistence, BanStatus status)
+    {
+        await persistence.ConfigureAwait(false);
+        return status;
     }
 
     /// <inheritdoc/>
@@ -283,7 +301,7 @@ public sealed class BanService : IBanService, IDisposable, IAsyncDisposable
             await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
                              FileShare.None, 16384, FileOptions.Asynchronous | FileOptions.WriteThrough))
             {
-                await JsonSerializer.SerializeAsync(stream, snapshot, ServerJsonContext.Default.BanEntryArray).ConfigureAwait(false);
+                await JsonSerializer.SerializeAsync(stream, snapshot, BanStoreJsonContext.Default.BanEntryArray).ConfigureAwait(false);
                 await stream.FlushAsync().ConfigureAwait(false);
             }
 

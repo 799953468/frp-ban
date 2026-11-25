@@ -7,107 +7,76 @@ using FrpBan.Services;
 namespace FrpBan.Handlers;
 
 /// <summary>
-/// Processes frps plugin HTTP callbacks and returns allow/deny decisions
-/// based on the current IP ban list.
+/// Processes frps plugin callbacks and returns allow/deny decisions based on the current ban list.
+/// Login and NewUserConn fail closed: malformed payloads are denied.
 /// </summary>
 public sealed class PluginRequestHandler(
     IBanService banService,
     ILogger<PluginRequestHandler> logger)
 {
-    /// <summary>
-    /// Handles an inbound plugin request from frps and returns a <see cref="PluginResponse"/>.
-    /// </summary>
-    public Task<PluginResponse> HandleAsync(PluginRequest request, HttpContext ctx)
+    /// <summary>Handles one frps plugin request.</summary>
+    /// <param name="request">The callback envelope.</param>
+    /// <param name="requestId">The X-Frp-Reqid header, for diagnostics only.</param>
+    public PluginResponse Handle(PluginRequest request, string? requestId = null)
     {
-        logger.LogDebug("Plugin op={Op} reqid={ReqId}", request.Op,
-            ctx.Request.Headers["X-Frp-Reqid"]);
-
-        if (request.Op is "Login" or "NewUserConn" && request.Content.ValueKind != JsonValueKind.Object)
-            return Task.FromResult(PluginResponse.Deny("invalid plugin payload"));
+        logger.LogDebug("Plugin op={Op} reqid={ReqId}", request.Op, requestId);
         try
         {
             return request.Op switch
             {
-                "Login" => HandleLoginAsync(request),
-                "NewUserConn" => HandleNewUserConnAsync(request),
-                _ => Task.FromResult(PluginResponse.Allow),
+                "Login" => HandleLogin(request.Content),
+                "NewUserConn" => HandleNewUserConn(request.Content),
+                _ => PluginResponse.Allow,
             };
         }
         catch (JsonException)
         {
-            return Task.FromResult(PluginResponse.Deny("invalid plugin payload"));
+            return PluginResponse.Deny("invalid plugin payload");
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Operation handlers
-    // -------------------------------------------------------------------------
-
-    /// <summary>
-    /// Checks whether the frpc client's IP is banned before the client is
-    /// allowed to authenticate and register proxies.
-    /// </summary>
-    private Task<PluginResponse> HandleLoginAsync(PluginRequest request)
+    /// <summary>Rejects a banned frpc client before it can authenticate and register proxies.</summary>
+    private PluginResponse HandleLogin(JsonElement content)
     {
-        var content = request.Content.Deserialize(ServerJsonContext.Default.LoginContent);
-        if (content is null)
-            return Task.FromResult(PluginResponse.Deny("invalid login payload"));
+        if (content.ValueKind != JsonValueKind.Object)
+            return PluginResponse.Deny("invalid plugin payload");
 
-        var ip = ParseIp(content.ClientAddress);
-        if (ip is null)
-            return Task.FromResult(PluginResponse.Deny("invalid client address"));
-        if (ip is not null && banService.IsBanned(ip))
-        {
-            logger.LogWarning("Login rejected — banned IP {Ip} (run_id={RunId})",
-                ip, content.RunId);
-            return Task.FromResult(PluginResponse.Deny($"IP {ip} is banned"));
-        }
+        var login = content.Deserialize(ServerJsonContext.Default.LoginContent);
+        if (ParseIp(login?.ClientAddress) is not { } ip)
+            return PluginResponse.Deny("invalid client address");
+        if (!banService.IsBanned(ip))
+            return PluginResponse.Allow;
 
-        return Task.FromResult(PluginResponse.Allow);
+        logger.LogWarning("Login rejected — banned IP {Ip} (run_id={RunId})", ip, login!.RunId);
+        return PluginResponse.Deny($"IP {ip} is banned");
     }
 
-    /// <summary>
-    /// Checks whether the end-user's IP (the person connecting through the
-    /// frp tunnel) is banned before allowing the connection to be forwarded.
-    /// </summary>
-    private Task<PluginResponse> HandleNewUserConnAsync(PluginRequest request)
+    /// <summary>Rejects a banned end user before the connection is forwarded through the tunnel.</summary>
+    private PluginResponse HandleNewUserConn(JsonElement content)
     {
-        var content = request.Content.Deserialize(ServerJsonContext.Default.NewUserConnContent);
-        if (content is null)
-            return Task.FromResult(PluginResponse.Deny("invalid NewUserConn payload"));
+        if (content.ValueKind != JsonValueKind.Object)
+            return PluginResponse.Deny("invalid plugin payload");
 
-        var ip = ParseIp(content.RemoteAddr);
-        if (ip is null)
-            return Task.FromResult(PluginResponse.Deny("invalid remote address"));
-        if (ip is not null && banService.IsBanned(ip))
-        {
-            logger.LogWarning(
-                "NewUserConn rejected — banned IP {Ip} (proxy={Proxy}, type={Type})",
-                ip, content.ProxyName, content.ProxyType);
-            return Task.FromResult(PluginResponse.Deny($"IP {ip} is banned"));
-        }
+        var connection = content.Deserialize(ServerJsonContext.Default.NewUserConnContent);
+        if (ParseIp(connection?.RemoteAddr) is not { } ip)
+            return PluginResponse.Deny("invalid remote address");
+        if (!banService.IsBanned(ip))
+            return PluginResponse.Allow;
 
-        return Task.FromResult(PluginResponse.Allow);
+        logger.LogWarning("NewUserConn rejected — banned IP {Ip} (proxy={Proxy}, type={Type})",
+            ip, connection!.ProxyName, connection.ProxyType);
+        return PluginResponse.Deny($"IP {ip} is banned");
     }
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
-
-    /// <summary>
-    /// Parses the IP from an "IP:port" string, or returns null on failure.
-    /// </summary>
+    /// <summary>Returns the canonical IP from "IP", "IP:port" or "[IPv6]:port", or null.</summary>
     private static string? ParseIp(string? address)
     {
-        if (string.IsNullOrWhiteSpace(address)) return null;
-
+        if (string.IsNullOrWhiteSpace(address))
+            return null;
         if (IpAddressUtilities.Normalize(address) is { } literal)
             return literal;
-
-        // IPEndPoint.TryParse handles both "1.2.3.4:80" and "[::1]:80".
-        if (IPEndPoint.TryParse(address, out var endpoint))
-            return IpAddressUtilities.Normalize(endpoint.Address.ToString());
-
-        return null;
+        return IPEndPoint.TryParse(address, out var endpoint)
+            ? IpAddressUtilities.Normalize(endpoint.Address.ToString())
+            : null;
     }
 }

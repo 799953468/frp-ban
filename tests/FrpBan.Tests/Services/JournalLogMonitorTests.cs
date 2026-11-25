@@ -43,7 +43,7 @@ public class JournalLogMonitorTests
     [Fact]
     public async Task Output_MatchesRegexAndJsonAndPreservesDeliveryOrder()
     {
-        var matches = new List<(string ip, int? duration, string reason)>();
+        var matches = new List<BanMatch>();
         var monitor = CreateMonitor(CreateRule(), batch =>
         {
             matches.AddRange(batch);
@@ -55,11 +55,11 @@ public class JournalLogMonitorTests
             await monitor.ProcessOutputAsync(reader, CancellationToken.None);
         }
 
-        Assert.Equal(new[] { "192.0.2.1", "2001:db8::1", "192.0.2.2" }, matches.Select(match => match.ip));
+        Assert.Equal(new[] { "192.0.2.1", "2001:db8::1", "192.0.2.2" }, matches.Select(match => match.Ip));
         Assert.All(matches, match =>
         {
-            Assert.Equal(120, match.duration);
-            Assert.Equal("Journal test", match.reason);
+            Assert.Equal(120, match.DurationSeconds);
+            Assert.Equal("Journal test", match.Reason);
         });
     }
 
@@ -89,7 +89,7 @@ public class JournalLogMonitorTests
         var matches = new List<string>();
         var monitor = CreateMonitor(CreateRule(), batch =>
         {
-            matches.AddRange(batch.Select(match => match.ip));
+            matches.AddRange(batch.Select(match => match.Ip));
             return Task.CompletedTask;
         });
         var prefix = "Failed 192.0.2.1 ";
@@ -109,7 +109,7 @@ public class JournalLogMonitorTests
         var matches = new List<string>();
         var monitor = CreateMonitor(CreateRule(), batch =>
         {
-            matches.AddRange(batch.Select(match => match.ip));
+            matches.AddRange(batch.Select(match => match.Ip));
             return Task.CompletedTask;
         });
         using (var reader = new StringReader("Failed 192.0.2.1"))
@@ -178,7 +178,7 @@ public class JournalLogMonitorTests
         var matches = new List<string>();
         var monitor = CreateMonitor(CreateRule(), batch =>
         {
-            matches.AddRange(batch.Select(match => match.ip));
+            matches.AddRange(batch.Select(match => match.Ip));
             return Task.CompletedTask;
         });
         var command = ShellCommand("i=0; while [ \"$i\" -lt 10000 ]; do " +
@@ -273,7 +273,7 @@ public class JournalLogMonitorTests
     }
 
     private static JournalLogMonitor CreateMonitor(BanRule rule,
-        Func<List<(string ip, int? durationSeconds, string reason)>, Task>? onMatches = null)
+        Func<IReadOnlyList<BanMatch>, Task>? onMatches = null)
     {
         return new JournalLogMonitor(NullLogger.Instance, rule,
             new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance), onMatches ?? (_ => Task.CompletedTask));

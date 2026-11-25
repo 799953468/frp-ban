@@ -73,11 +73,14 @@ public sealed class ClientConnectionService : IDisposable
                 ClientCertificates = certificates,
                 EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
             }, timeout.Token).ConfigureAwait(false);
-            await stream.WriteAsync(new HelloMessage("1.0", "frp-ban-client", _tokenHash).Serialize(), timeout.Token)
+            await stream.WriteAsync(new HelloMessage(ProtocolConstants.Version, ProtocolConstants.ClientClientType, _tokenHash)
+                    .Serialize(), timeout.Token)
                 .ConfigureAwait(false);
             var reply = await MessageTransport.ReadAsync(stream, timeout.Token).ConfigureAwait(false);
-            if (reply is not HelloMessage { Version: "1.0", ClientType: "server" })
+            if (reply is not HelloMessage { Version: ProtocolConstants.Version, ClientType: ProtocolConstants.ServerClientType })
+            {
                 throw new InvalidDataException("Server rejected HELLO.");
+            }
             lock (_state)
             {
                 if (!ReferenceEquals(_sslStream, stream))
@@ -117,18 +120,19 @@ public sealed class ClientConnectionService : IDisposable
     }
 
     /// <summary>Sends a ban and waits for its corresponding response.</summary>
-    public async Task<bool> SendBanRequestAsync(string ip, string? reason, int? durationSeconds,
-        CancellationToken cancellationToken)
+    /// <returns>The server's status, or null when no response arrived (the request may be retried).</returns>
+    public async Task<BanStatus?> SendBanRequestAsync(BanRequestMessage request, CancellationToken cancellationToken)
     {
-        var response = await ExchangeAsync(new BanRequestMessage(ip, reason, durationSeconds), cancellationToken)
-            .ConfigureAwait(false);
-        if (response is BanResponseMessage ban)
+        var response = await ExchangeAsync(request, cancellationToken).ConfigureAwait(false);
+        if (response is not BanResponseMessage ban)
         {
-            if (!ban.Success)
-                _logger.LogWarning("Ban request rejected: {Message}", ban.Message);
-            return ban.Success;
+            return null;
         }
-        return false;
+        if (!ban.Success)
+        {
+            _logger.LogWarning("Ban request for {Ip} not applied ({Status}): {Message}", request.Ip, ban.Status, ban.Message);
+        }
+        return ban.Status;
     }
 
     /// <summary>Sends a health check and verifies the matching sequence number.</summary>
