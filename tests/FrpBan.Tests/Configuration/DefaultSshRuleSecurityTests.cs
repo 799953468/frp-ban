@@ -1,4 +1,5 @@
 using FrpBan.Client.Configuration;
+using FrpBan.Client.Matching;
 using FrpBan.Client.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -83,7 +84,7 @@ public class DefaultSshRuleSecurityTests
                 line += " [preauth]";
             }
 
-            for (var index = 1; index < rule.Action.MaxMatches; index++)
+            for (var index = 1; index < rule.Definition.Action.MaxMatches; index++)
             {
                 Assert.Empty(engine.ProcessLogLine(line, rule));
             }
@@ -92,16 +93,16 @@ public class DefaultSshRuleSecurityTests
         }
     }
 
-    private static void AssertIgnored(BanRule rule, string line)
+    private static void AssertIgnored(CompiledRule rule, string line)
     {
         var engine = new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance);
-        for (var index = 0; index <= rule.Action.MaxMatches; index++)
+        for (var index = 0; index <= rule.Definition.Action.MaxMatches; index++)
         {
             Assert.Empty(engine.ProcessLogLine(line, rule));
         }
     }
 
-    private static string BuildLogLine(BanRule rule, string prefix, string username, string source)
+    private static string BuildLogLine(CompiledRule rule, string prefix, string username, string source)
     {
         if (rule.Name == "SSH Brute Force")
         {
@@ -111,7 +112,7 @@ public class DefaultSshRuleSecurityTests
         return $"{prefix} Invalid user {username} from {source} port 54321";
     }
 
-    private static List<BanRule> LoadBundledRules()
+    private static List<CompiledRule> LoadBundledRules()
     {
         var rules = new RulesLoader(NullLogger<RulesLoader>.Instance)
             .LoadRules(Path.Combine(AppContext.BaseDirectory, "rules.d"));

@@ -58,7 +58,7 @@ public sealed class ClientSettings : IValidatableObject
         return Validate();
     }
 
-    /// <summary>Validates settings without reflection so checks also run in Native AOT builds.</summary>
+    /// <summary>Returns every configuration error; used by <see cref="ClientSettingsValidator"/> at startup.</summary>
     public IEnumerable<ValidationResult> Validate()
     {
         if (string.IsNullOrWhiteSpace(ServerAddress) || ServerPort is < 1 or > 65535)
@@ -71,9 +71,9 @@ public sealed class ClientSettings : IValidatableObject
             yield return new ValidationResult("Token must be a non-placeholder secret of at least 32 characters.");
         }
 
-        if (Tls is null || !Tls.Enabled)
+        if (Tls is null)
         {
-            yield return new ValidationResult("TLS must be enabled.");
+            yield return new ValidationResult("Tls must be a configuration object.");
         }
 
         if (ConnectionTimeoutSeconds is < 1 or > 300 || RequestTimeoutSeconds is < 1 or > 300)
@@ -97,15 +97,10 @@ public sealed class ClientSettings : IValidatableObject
 }
 
 /// <summary>
-/// TLS/HTTPS configuration for the client.
+/// TLS configuration for the client. TLS is always on; these settings control trust and client certificates.
 /// </summary>
 public sealed class ClientTlsSettings
 {
-    /// <summary>
-    /// Enable TLS for client-server communication.
-    /// </summary>
-    public bool Enabled { get; set; } = true;
-
     /// <summary>
     /// Path to the client certificate file (.pfx).
     /// </summary>

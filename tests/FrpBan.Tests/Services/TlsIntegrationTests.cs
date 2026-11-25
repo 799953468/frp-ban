@@ -46,14 +46,14 @@ public class TlsIntegrationTests : IAsyncLifetime
     }
 
     private async Task<TcpServerService> StartServerAsync(bool mutualTls = false, int maxMessages = 120,
-        IBanService? bans = null, ILogger<TcpServerService>? logger = null)
+        IBanService? bans = null, ILogger<TcpServerService>? logger = null, int port = 0)
     {
         var server = new TcpServerService(logger ?? NullLogger<TcpServerService>.Instance, Options.Create(new PluginSettings
         {
             Token = Token,
             Tls = new TlsSettings
             {
-                Enabled = true, Port = 0, CertificatePath = Path.Combine(_directory, "server.pfx"),
+                Enabled = true, Port = port, CertificatePath = Path.Combine(_directory, "server.pfx"),
                 RequireClientCertificate = mutualTls, ClientCertificateAuthority = AuthorityPath,
                 HandshakeTimeoutSeconds = 2, MaxMessagesPerMinute = maxMessages,
             },
@@ -337,6 +337,59 @@ public class TlsIntegrationTests : IAsyncLifetime
         Assert.IsType<ErrorMessage>(await MessageTransport.ReadAsync(tls, deadline.Token));
         Assert.Null(await MessageTransport.ReadAsync(tls, deadline.Token));
         _bans.Verify(service => service.BanAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Worker_DeliversBansDetectedBeforeTheServerIsReachable()
+    {
+        var probe = new TcpListener(System.Net.IPAddress.Loopback, 0);
+        probe.Start();
+        var port = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port;
+        probe.Stop();
+        var logPath = Path.Combine(_directory, "auth.log");
+        await File.WriteAllTextAsync(logPath, "");
+        var rulesPath = Path.Combine(_directory, "rules.yaml");
+        await File.WriteAllTextAsync(rulesPath, $$"""
+                                                  rules:
+                                                    - name: early
+                                                      logSource: { type: file, path: '{{logPath}}' }
+                                                      matching:
+                                                        - pattern: 'attack from (?<ip>\S+)'
+                                                      action: { type: immediate, banDurationSeconds: 60 }
+                                                  """);
+        var settings = Options.Create(new ClientSettings
+        {
+            ServerAddress = "127.0.0.1", ServerPort = port, Token = Token, RulesPath = rulesPath,
+            Tls = new ClientTlsSettings { CaCertificatePath = AuthorityPath },
+            Reconnection = new ReconnectionSettings { InitialDelayMs = 50, MaxDelayMs = 100 },
+        });
+        var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _bans.Setup(service => service.BanAsync("192.0.2.30", It.IsAny<string>(), 60))
+            .Returns(() => { delivered.TrySetResult(); return Task.FromResult(BanStatus.Applied); });
+        using var connection = new ClientConnectionService(settings, NullLogger<ClientConnectionService>.Instance);
+        var worker = new ClientWorker(settings, new RulesLoader(NullLogger<RulesLoader>.Instance),
+            new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance), connection,
+            new BanDeliveryService(connection, settings, NullLogger<BanDeliveryService>.Instance),
+            NullLoggerFactory.Instance, Mock.Of<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(),
+            NullLogger<ClientWorker>.Instance);
+        await worker.StartAsync(CancellationToken.None);
+        try
+        {
+            // Every attack line is written while nothing listens on the port.
+            for (var i = 0; i < 10; i++)
+            {
+                await File.AppendAllTextAsync(logPath, "attack from 192.0.2.30\n");
+                await Task.Delay(100);
+            }
+
+            Assert.False(delivered.Task.IsCompleted);
+            await StartServerAsync(port: port);
+            await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]

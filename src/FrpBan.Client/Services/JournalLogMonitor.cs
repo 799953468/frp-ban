@@ -2,7 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
-using FrpBan.Client.Configuration;
+using FrpBan.Client.Matching;
 using Microsoft.Extensions.Logging;
 
 namespace FrpBan.Client.Services;
@@ -21,7 +21,7 @@ public sealed class JournalLogMonitor : LogMonitor
     /// <param name="onMatches">Asynchronous callback that delivers matched bans.</param>
     public JournalLogMonitor(
         ILogger logger,
-        BanRule rule,
+        CompiledRule rule,
         RuleMatchEngine matchEngine,
         Func<IReadOnlyList<BanMatch>, Task> onMatches)
         : base(logger, rule, matchEngine, onMatches)
@@ -42,7 +42,8 @@ public sealed class JournalLogMonitor : LogMonitor
 
     internal ProcessStartInfo CreateStartInfo()
     {
-        if (string.IsNullOrWhiteSpace(_rule.LogSource.Service))
+        var service = _rule.Definition.LogSource.Service;
+        if (string.IsNullOrWhiteSpace(service))
         {
             throw new InvalidOperationException($"Rule '{_rule.Name}': a journal service is required.");
         }
@@ -62,7 +63,7 @@ public sealed class JournalLogMonitor : LogMonitor
         startInfo.ArgumentList.Add("--no-pager");
         startInfo.ArgumentList.Add("--system");
         // Keep the unit in a single option value; never interpret it as shell text or another option.
-        startInfo.ArgumentList.Add($"--unit={_rule.LogSource.Service}");
+        startInfo.ArgumentList.Add($"--unit={service}");
         startInfo.Environment["SYSTEMD_COLORS"] = "0";
         return startInfo;
     }
@@ -90,7 +91,7 @@ public sealed class JournalLogMonitor : LogMonitor
                 try
                 {
                     _logger.LogInformation("Rule {Rule}: following journal messages for {Service}",
-                        _rule.Name, _rule.LogSource.Service);
+                        _rule.Name, _rule.Definition.LogSource.Service);
                     await ProcessOutputAsync(process.StandardOutput, cancellationToken).ConfigureAwait(false);
                     await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
                     var lastDiagnostic = await diagnostics.ConfigureAwait(false);
@@ -136,11 +137,7 @@ public sealed class JournalLogMonitor : LogMonitor
         await foreach (var line in ReadLinesAsync(reader, RuleMatchEngine.MaxLogLineLength,
                            includeFinalLine: false, cancellationToken).ConfigureAwait(false))
         {
-            var matches = _matchEngine.ProcessLogLine(line, _rule);
-            if (matches.Count > 0)
-            {
-                await _onMatches(matches).ConfigureAwait(false);
-            }
+            await ProcessLineAsync(line).ConfigureAwait(false);
         }
     }
 
@@ -164,51 +161,21 @@ public sealed class JournalLogMonitor : LogMonitor
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var buffer = new char[4096];
-        var line = new StringBuilder();
-        var discarding = false;
+        var lines = new LineAccumulator(maxLength,
+            () => _logger.LogWarning("Rule {Rule}: discarding oversized journalctl output line", _rule.Name));
         int count;
         while ((count = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false)) > 0)
         {
             for (var i = 0; i < count; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var character = buffer[i];
-                if (character == '\n')
-                {
-                    if (!discarding)
-                    {
-                        if (line.Length > 0 && line[^1] == '\r')
-                        {
-                            line.Length--;
-                        }
-
-                        yield return line.ToString();
-                    }
-
-                    line.Clear();
-                    discarding = false;
-                }
-                else if (!discarding)
-                {
-                    // Allow a trailing CR at the limit, without retaining unbounded partial lines.
-                    if (line.Length >= maxLength && !(line.Length == maxLength && character == '\r'))
-                    {
-                        line.Clear();
-                        discarding = true;
-                        _logger.LogWarning("Rule {Rule}: discarding oversized journalctl output line", _rule.Name);
-                    }
-                    else
-                    {
-                        line.Append(character);
-                    }
-                }
+                if (lines.Append(buffer[i]) is { } line)
+                    yield return line;
             }
         }
 
         // stdout records must end in a newline; never match an incomplete message after a process failure.
-        if (includeFinalLine && !discarding && line.Length > 0)
-        {
-            yield return line.ToString();
-        }
+        if (includeFinalLine && lines.Flush() is { } finalLine)
+            yield return finalLine;
     }
 }

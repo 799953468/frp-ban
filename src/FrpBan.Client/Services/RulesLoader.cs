@@ -1,11 +1,12 @@
 using FrpBan.Client.Configuration;
+using FrpBan.Client.Matching;
 using Microsoft.Extensions.Logging;
 
 namespace FrpBan.Client.Services;
 
 /// <summary>
-/// Loads ban rules from YAML configuration files.
-/// Supports both single file and conf.d style directory.
+/// Loads and compiles ban rules from a YAML file or a conf.d style directory.
+/// Unreadable files and invalid or duplicate rules are logged and skipped; the remaining rules still load.
 /// </summary>
 public sealed class RulesLoader
 {
@@ -18,16 +19,16 @@ public sealed class RulesLoader
 
     /// <summary>
     /// Loads rules from a YAML file or directory (conf.d style).
-    /// If path is a directory, loads all .yaml and .yml files in it.
+    /// If path is a directory, loads all .yaml and .yml files in it, in ordinal file-name order.
     /// </summary>
-    public List<BanRule> LoadRules(string? rulesPath)
+    public List<CompiledRule> LoadRules(string? rulesPath)
     {
         var rules = new List<BanRule>();
 
         if (string.IsNullOrWhiteSpace(rulesPath))
         {
             _logger.LogWarning("Rules path not configured, no rules will be loaded");
-            return rules;
+            return [];
         }
 
         if (Directory.Exists(rulesPath))
@@ -46,34 +47,43 @@ public sealed class RulesLoader
         else
         {
             _logger.LogError("Rules path not found (not a file or directory): {Path}", rulesPath);
-            return rules;
+            return [];
         }
 
         var names = new HashSet<string>(StringComparer.Ordinal);
-        rules = rules.Where(rule =>
+        var compiled = new List<CompiledRule>();
+        foreach (var rule in rules)
         {
             if (rule is null)
             {
                 _logger.LogError("Ignoring null rule");
-                return false;
+                continue;
             }
 
-            var error = RuleValidator.Validate(rule);
-            if (error is not null || !names.Add(rule.Name))
+            try
             {
-                _logger.LogError("Ignoring rule {Name}: {Error}", rule.Name, error ?? "Duplicate rule name");
-                return false;
-            }
+                var compiledRule = CompiledRule.Compile(rule);
+                if (!names.Add(rule.Name))
+                {
+                    _logger.LogError("Ignoring rule {Name}: Duplicate rule name", rule.Name);
+                    continue;
+                }
 
-            return true;
-        }).ToList();
-        _logger.LogInformation("Loaded {Count} total rule(s)", rules.Count);
-        foreach (var rule in rules)
+                compiled.Add(compiledRule);
+            }
+            catch (InvalidDataException ex)
+            {
+                _logger.LogError("Ignoring rule {Name}: {Error}", rule.Name, ex.Message);
+            }
+        }
+
+        _logger.LogInformation("Loaded {Count} total rule(s)", compiled.Count);
+        foreach (var rule in compiled)
         {
             _logger.LogInformation("  Rule: {Name} (enabled={Enabled})", rule.Name, rule.Enabled);
         }
 
-        return rules;
+        return compiled;
     }
 
     private List<BanRule> LoadRulesFromDirectory(string directoryPath)

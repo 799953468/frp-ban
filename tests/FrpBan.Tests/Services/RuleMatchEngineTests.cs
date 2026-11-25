@@ -24,7 +24,8 @@ public class RuleMatchEngineTests
         {
             Enabled = false,
             Name = "Test Rule",
-            Matching = new List<MatchExpression>()
+            Matching = [new MatchExpression { Pattern = @"(?<ip>\d+\.\d+\.\d+\.\d+)" }],
+            Action = new BanAction { Type = "immediate" },
         };
 
         // Act
@@ -227,10 +228,9 @@ public class RuleMatchEngineTests
     }
 
     [Fact]
-    public void ProcessLogLine_WithInvalidRegex_HandlesGracefully()
+    public void InvalidRegex_IsRejectedWhenTheRuleIsCompiled()
     {
         // Arrange
-        var engine = new RuleMatchEngine(_loggerMock.Object);
         var rule = new BanRule
         {
             Enabled = true,
@@ -251,9 +251,9 @@ public class RuleMatchEngineTests
             }
         };
 
-        // Act & Assert - Should not throw
-        var result = engine.ProcessLogLine("Some log line", rule);
-        Assert.Empty(result);
+        // Act & Assert - the loader logs and skips such rules instead of running them
+        var error = Assert.Throws<InvalidDataException>(() => rule.Compiled());
+        Assert.StartsWith("Invalid regex", error.Message);
     }
 
     [Fact]

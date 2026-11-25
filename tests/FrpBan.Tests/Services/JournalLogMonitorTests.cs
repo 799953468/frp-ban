@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using FrpBan.Client.Configuration;
+using FrpBan.Client.Matching;
 using FrpBan.Client.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -36,8 +37,9 @@ public class JournalLogMonitorTests
     [InlineData(" ")]
     public void Command_RequiresService(string? service)
     {
-        var monitor = CreateMonitor(CreateRule(service: service));
-        Assert.Throws<InvalidOperationException>(() => monitor.CreateStartInfo());
+        // A journal rule without a unit is rejected when compiled, before any monitor can exist.
+        var error = Assert.Throws<InvalidDataException>(() => CompiledRule.Compile(CreateRule(service: service)));
+        Assert.Contains("journal", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -272,11 +274,9 @@ public class JournalLogMonitorTests
         return command;
     }
 
-    private static JournalLogMonitor CreateMonitor(BanRule rule,
-        Func<IReadOnlyList<BanMatch>, Task>? onMatches = null)
+    private static JournalLogMonitor CreateMonitor(BanRule rule, Func<IReadOnlyList<BanMatch>, Task>? onMatches = null)
     {
-        return new JournalLogMonitor(NullLogger.Instance, rule,
-            new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance), onMatches ?? (_ => Task.CompletedTask));
+        return new JournalLogMonitor(NullLogger.Instance, rule.Compiled(), new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance), onMatches ?? (_ => Task.CompletedTask));
     }
 
     private static BanRule CreateRule(string? service = "ssh.service", BanAction? action = null)

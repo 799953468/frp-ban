@@ -85,10 +85,13 @@ public class FileLogMonitorTests
                 Matching = [new MatchExpression { Pattern = pattern }],
                 Action = new BanAction { Type = "immediate" },
             };
-            var monitor = new FileLogMonitor(NullLogger.Instance, rule,
+            var monitor = new FileLogMonitor(NullLogger.Instance, rule.Compiled(),
                 new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance), matches =>
                 {
-                    foreach (var match in matches) fixture.Matches.Writer.TryWrite(match.Ip);
+                    foreach (var match in matches)
+                    {
+                        fixture.Matches.Writer.TryWrite(match.Ip);
+                    }
                     return Task.CompletedTask;
                 });
             fixture._task = monitor.StartAsync(fixture._stopping.Token);

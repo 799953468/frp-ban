@@ -18,7 +18,7 @@ public class RulesLoaderTests
             var line = rule.Name == "SSH Brute Force"
                 ? "sshd: Failed password for root from 192.0.2.1 port 22 ssh2"
                 : "sshd: Invalid user nobody from 192.0.2.1 port 22";
-            for (var i = 1; i < rule.Action.MaxMatches; i++)
+            for (var i = 1; i < rule.Definition.Action.MaxMatches; i++)
             {
                 Assert.Empty(engine.ProcessLogLine(line, rule));
             }
@@ -155,7 +155,7 @@ public class RulesLoaderTests
         Assert.Equal("journal", rule.LogSource.Type);
         Assert.Equal(service, rule.LogSource.Service);
         Assert.Null(rule.LogSource.Path);
-        var monitor = LogMonitor.Create(rule, new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance),
+        var monitor = LogMonitor.Create(rule.Compiled(), new RuleMatchEngine(NullLogger<RuleMatchEngine>.Instance),
             _ => Task.CompletedTask, NullLogger.Instance);
         Assert.IsType<JournalLogMonitor>(monitor);
     }
@@ -190,7 +190,8 @@ public class RulesLoaderTests
         try
         {
             File.WriteAllText(path, yaml);
-            return new RulesLoader(NullLogger<RulesLoader>.Instance).LoadRules(path);
+            return new RulesLoader(NullLogger<RulesLoader>.Instance).LoadRules(path)
+                .Select(rule => rule.Definition).ToList();
         }
         finally
         {

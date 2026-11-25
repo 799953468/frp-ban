@@ -1,21 +1,19 @@
-using FrpBan.Client.Configuration;
+using FrpBan.Client.Matching;
 using Microsoft.Extensions.Logging;
 
 namespace FrpBan.Client.Services;
 
-/// <summary>
-/// Abstract base for log monitoring.
-/// </summary>
+/// <summary>Reads complete lines from one log source and hands rule matches to a callback.</summary>
 public abstract class LogMonitor
 {
     protected readonly ILogger _logger;
-    protected readonly BanRule _rule;
+    protected readonly CompiledRule _rule;
     protected readonly RuleMatchEngine _matchEngine;
     protected readonly Func<IReadOnlyList<BanMatch>, Task> _onMatches;
 
     protected LogMonitor(
         ILogger logger,
-        BanRule rule,
+        CompiledRule rule,
         RuleMatchEngine matchEngine,
         Func<IReadOnlyList<BanMatch>, Task> onMatches)
     {
@@ -25,25 +23,29 @@ public abstract class LogMonitor
         _onMatches = onMatches;
     }
 
-    /// <summary>
-    /// Start monitoring logs.
-    /// </summary>
+    /// <summary>Monitors until cancelled. Any other completion means the monitor failed.</summary>
     public abstract Task StartAsync(CancellationToken cancellationToken);
 
-    /// <summary>
-    /// Factory method to create appropriate monitor based on rule's log source.
-    /// </summary>
+    /// <summary>Creates the monitor for the rule's log source.</summary>
     public static LogMonitor Create(
-        BanRule rule,
+        CompiledRule rule,
         RuleMatchEngine matchEngine,
         Func<IReadOnlyList<BanMatch>, Task> onMatches,
         ILogger logger)
     {
-        return rule.LogSource.Type switch
+        return rule.SourceKind switch
         {
-            "file" => new FileLogMonitor(logger, rule, matchEngine, onMatches),
-            "journal" => new JournalLogMonitor(logger, rule, matchEngine, onMatches),
-            _ => throw new InvalidOperationException($"Unknown log source type: {rule.LogSource.Type}"),
+            LogSourceKind.File => new FileLogMonitor(logger, rule, matchEngine, onMatches),
+            LogSourceKind.Journal => new JournalLogMonitor(logger, rule, matchEngine, onMatches),
+            _ => throw new InvalidOperationException($"Unknown log source kind: {rule.SourceKind}"),
         };
+    }
+
+    /// <summary>Matches one complete line and delivers any resulting bans.</summary>
+    protected async Task ProcessLineAsync(string line)
+    {
+        var matches = _matchEngine.ProcessLogLine(line, _rule);
+        if (matches.Count > 0)
+            await _onMatches(matches).ConfigureAwait(false);
     }
 }

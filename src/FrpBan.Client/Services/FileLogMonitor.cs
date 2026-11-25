@@ -1,13 +1,13 @@
 using System.Text;
 using System.Threading.Channels;
-using FrpBan.Client.Configuration;
+using FrpBan.Client.Matching;
 using Microsoft.Extensions.Logging;
 
 namespace FrpBan.Client.Services;
 
 /// <summary>Processes coalesced file notifications in one worker, retaining partial UTF-8 lines.</summary>
 public sealed class FileLogMonitor(
-    ILogger logger, BanRule rule, RuleMatchEngine matchEngine,
+    ILogger logger, CompiledRule rule, RuleMatchEngine matchEngine,
     Func<IReadOnlyList<BanMatch>, Task> onMatches)
     : LogMonitor(logger, rule, matchEngine, onMatches)
 {
@@ -21,7 +21,8 @@ public sealed class FileLogMonitor(
     /// <inheritdoc/>
     public override async Task StartAsync(CancellationToken cancellationToken)
     {
-        var path = Path.GetFullPath(_rule.LogSource.Path ?? throw new InvalidOperationException("Log path is required."));
+        var path = Path.GetFullPath(_rule.Definition.LogSource.Path ??
+                                    throw new InvalidOperationException("Log path is required."));
         var initialPosition = File.Exists(path) ? new FileInfo(path).Length : 0;
         using var watcher = new FileSystemWatcher(Path.GetDirectoryName(path)!, Path.GetFileName(path))
         {
@@ -39,8 +40,8 @@ public sealed class FileLogMonitor(
         watcher.EnableRaisingEvents = true;
 
         FileStream? stream = null;
-        var partial = new StringBuilder();
-        var discarding = false;
+        var lines = new LineAccumulator(RuleMatchEngine.MaxLogLineLength,
+            () => _logger.LogWarning("Discarding oversized log line in {Path}", path));
         var creationTime = DateTime.MinValue;
         var bytes = new byte[4096];
         var characters = new char[Encoding.UTF8.GetMaxCharCount(bytes.Length)];
@@ -64,12 +65,12 @@ public sealed class FileLogMonitor(
                     {
                         stream?.Dispose();
                         stream = null;
-                        partial.Clear();
-                        discarding = false;
+                        lines.Reset();
                         position = 0;
                         atBeginning = true;
                         decoder.Reset();
                     }
+
                     if (stream is null)
                     {
                         stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
@@ -77,6 +78,7 @@ public sealed class FileLogMonitor(
                         creationTime = File.GetCreationTimeUtc(path);
                         stream.Seek(Math.Min(position, stream.Length), SeekOrigin.Begin);
                     }
+
                     int count;
                     while ((count = await stream.ReadAsync(bytes.AsMemory(), cancellationToken).ConfigureAwait(false)) > 0)
                     {
@@ -91,29 +93,9 @@ public sealed class FileLogMonitor(
                                 atBeginning = false;
                                 if (character == '\uFEFF') continue;
                             }
-                            if (character == '\n')
-                            {
-                                if (!discarding)
-                                {
-                                    if (partial.Length > 0 && partial[^1] == '\r')
-                                        partial.Length--;
-                                    var matches = _matchEngine.ProcessLogLine(partial.ToString(), _rule);
-                                    if (matches.Count > 0)
-                                        await _onMatches(matches).ConfigureAwait(false);
-                                }
-                                partial.Clear();
-                                discarding = false;
-                            }
-                            else if (!discarding)
-                            {
-                                if (partial.Length >= RuleMatchEngine.MaxLogLineLength)
-                                {
-                                    partial.Clear();
-                                    discarding = true;
-                                    _logger.LogWarning("Discarding oversized log line in {Path}", path);
-                                }
-                                else partial.Append(character);
-                            }
+
+                            if (lines.Append(character) is { } line)
+                                await ProcessLineAsync(line).ConfigureAwait(false);
                         }
                     }
                 }
